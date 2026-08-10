@@ -1,0 +1,78 @@
+# === PDFs =====================================================================
+
+import fitz
+
+OVERSIZE_PAGE_PT = 1000
+OVERSIZE_SKIP_RATIO = 0.95
+
+
+def _oversize_pages(pdf_path):
+    """(nombre de pages oversize, nombre total de pages) — lecture seule, pas de raster."""
+    doc = fitz.open(pdf_path)
+    sides = [max(doc[i].rect.width, doc[i].rect.height) for i in range(len(doc))]
+    doc.close()
+    return sum(1 for s in sides if s > OVERSIZE_PAGE_PT), len(sides)
+
+
+tar_path = SRC / "pdfs_for_QA/pdf_en.tar.gz"
+pdfs_dir = DST / "pdfs"
+log(f"\n[pdfs] opening {tar_path.name}...")
+
+with tarfile.open(tar_path) as tf:
+    members = tf.getmembers()
+    pdf_members = [
+        m for m in members
+        if m.isfile()
+        and m.name.lower().endswith(".pdf")
+        and not m.name.startswith("/")
+        and ".." not in Path(m.name).parts
+    ]
+    log(f"    archive: {len(members)} entries, {len(pdf_members)} PDFs")
+
+    # 1. Ne garder que les PDFs référencés par une query
+    #    (docs_needed a été calculé plus haut à partir de queries_en_clean.json)
+    kept_members = [
+        m for m in pdf_members
+        if Path(m.name).stem in docs_needed
+    ]
+    n_unused = len(pdf_members) - len(kept_members)
+    log(f"    referenced by a query: {len(kept_members)}  (skipped {n_unused} unused)")
+
+    # 2. Extraire (flatten) uniquement ces PDFs
+    n_extracted = n_already = 0
+    for m in kept_members:
+        target = pdfs_dir / Path(m.name).name
+        if target.exists() and target.stat().st_size == m.size:
+            n_already += 1
+            continue
+        with tf.extractfile(m) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        n_extracted += 1
+    log(f"    extracted: {n_extracted} new, {n_already} already present")
+
+# 3. Filtre oversize : supprimer les PDFs A3 après extraction
+pdfs_on_disk = sorted(p for p in pdfs_dir.iterdir() if p.suffix.lower() == ".pdf")
+oversize_removed = []
+for pdf in pdfs_on_disk:
+    n_over, n_total = _oversize_pages(pdf)
+    ratio = n_over / n_total if n_total else 0
+    if ratio >= OVERSIZE_SKIP_RATIO:
+        oversize_removed.append((pdf.stem, n_over, n_total, ratio))
+        pdf.unlink()
+
+log(f"\n    oversize PDFs removed (>= {OVERSIZE_SKIP_RATIO:.0%} pages > {OVERSIZE_PAGE_PT}pt):")
+for stem, n_over, n_total, ratio in oversize_removed:
+    log(f"      {stem}  ({n_over}/{n_total} pages, {ratio:.0%})")
+log(f"    total removed: {len(oversize_removed)}")
+
+# 4. Cross-check final
+pdfs_on_disk = sorted(p for p in pdfs_dir.iterdir() if p.suffix.lower() == ".pdf")
+log(f"\n    PDFs on disk after all filters: {len(pdfs_on_disk)}")
+
+pdf_stems = {p.stem for p in pdfs_on_disk}
+missing_pdfs = sorted(docs_needed - pdf_stems)
+log(f"    queried docs missing a PDF: {len(missing_pdfs)}")
+for d in missing_pdfs[:10]:
+    log(f"      - {d}")
+if len(missing_pdfs) > 10:
+    log(f"      ... and {len(missing_pdfs) - 10} more")
