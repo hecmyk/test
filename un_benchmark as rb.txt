@@ -1,0 +1,32 @@
+import run_benchmark as rb
+from tqdm import tqdm
+
+_run_one = rb.run_one          # l'original, gardé pour pouvoir revenir en arrière
+
+
+def _verbose_run_one(dom, skeleton, query):
+    row = _run_one(dom, skeleton, query)
+    m = row["agent_metrics"]
+
+    # tqdm.write plutôt que print : n'écrase pas la barre de progression.
+    tqdm.write(f"Q  {row['question']}")
+    tqdm.write(f"   gold   : {row['gold_answer']}  (pages {row['gold_pages']})")
+    tqdm.write(f"   pred   : {row['pred_answer']}")
+    tqdm.write(f"   quote  : {(row['pred_quote'] or '')[:120]}")
+    tqdm.write(f"   page   : {row['pred_source_page']}  (0-indexed, gold est 1-indexed)")
+    # .get partout : sur une exception agent, run_one ne garde que wall_clock_s.
+    tqdm.write(f"   steps={m.get('n_steps')} submit={m.get('submit_draft_source')} "
+               f"tokens={m.get('tokens', {}).get('total')} {m.get('duration_s')}s")
+    tqdm.write(f"   sections: {m.get('get_section_calls')}")
+    if m.get("invalid_tool_args"):
+        tqdm.write(f"   INVALID : {m['invalid_tool_args']}")
+    if row["error"]:
+        tqdm.write(f"   ERROR   : {row['error']}")
+    tqdm.write("")
+    return row
+
+
+rb.run_one = _verbose_run_one
+
+
+rb.run_benchmark("run2_no_nearby", limit=5, notes="retrait nearby_valid + note atom-id")
