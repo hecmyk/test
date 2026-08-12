@@ -1,0 +1,610 @@
+"""Ordre de lecture d'une page : dim7 pour le backbone, ancrage bbox pour les suspects.
+
+dim7 (colonne 6 de la sortie brute PP-DocLayoutV2) est l'index de query du pointer
+network : fiable là où le modèle est confiant, multi-colonnes compris. Mais une bbox à
+score faible reçoit un index bas, qui la colle en tête de page au tri. Ce module ne
+remplace pas dim7, il ne déplace que les items dont le dim7 est incohérent avec le reste
+de la page. Mesuré sur totalenergies.pdf (20 pages, 562 items post-A3b) : 19 items
+déplacés, concentrés sur 3 pages.
+
+Les primitives géométriques sont réimplémentées ici plutôt qu'importées de Layout.py :
+importer Layout charge le modèle Paddle (predictor module-level), et dom_build ne doit
+dépendre ni de paddle ni du modèle.
+"""
+
+from config import READING_FLOOR_MARGIN, READING_HI_SCORE
+
+Box = list[int]
+
+
+def _ioa(a: Box, b: Box) -> float:
+    """Intersection sur l'aire de la plus petite boîte (0.0 si disjointes)."""
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    smaller = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return (ix * iy) / smaller if smaller > 0 else 0.0
+
+
+def _edge_gap(a: Box, b: Box) -> float:
+    """Distance bord-à-bord (0.0 si les boîtes se touchent ou se chevauchent)."""
+    dx = max(0, max(a[0], b[0]) - min(a[2], b[2]))
+    dy = max(0, max(a[1], b[1]) - min(a[3], b[3]))
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _anchor(box: Box, items: list[dict], backbone: list[int]) -> int:
+    """Index de l'item backbone auquel rattacher `box`.
+
+    IoA d'abord (le suspect est contenu dans / chevauche un item), écart bord-à-bord
+    ensuite. IoU est inutilisable ici : nul avec TOUT le backbone pour 10 des 19 suspects
+    du corpus de calibration. Le centre-à-centre diverge sur 7/19 et se trompe (biais des
+    boîtes allongées). La clé finit par l'index : ordre total, donc déterminisme.
+    """
+    return min(backbone, key=lambda j: (-_ioa(box, items[j]["box"]),
+                                        _edge_gap(box, items[j]["box"]),
+                                        items[j]["dim7"], j))
+
+
+def reading_order(items: list[dict], hi_score: float = READING_HI_SCORE,
+                  margin: int = READING_FLOOR_MARGIN) -> list[int]:
+    """Indices de `items` en ordre de lecture, dim7 patché pour les items mal placés.
+
+    Le backbone (score >= hi_score) est trié par dim7. Les suspects (dim7 < floor - margin,
+    floor = min des dim7 du backbone) sont réinsérés à côté de leur ancre : avant elle si le
+    suspect est entièrement au-dessus, après sinon. Plusieurs suspects sur une même ancre
+    gardent leur ordre dim7 relatif. Sans backbone sur la page, l'ordre dim7 est renvoyé tel
+    quel. `items` n'est pas muté et aucun dim7 n'est réécrit.
+
+    Args:
+        items: Items d'UNE page, portant `score`, `box` et `dim7`.
+        hi_score: Score au-dessus duquel dim7 fait foi.
+        margin: Écart minimal sous le floor pour qu'un item soit réancré.
+
+    Returns:
+        Une permutation de `range(len(items))`.
+    """
+    order = sorted(range(len(items)), key=lambda i: (items[i]["dim7"], i))
+    backbone = [i for i in order if items[i]["score"] >= hi_score]
+    if not backbone:
+        return order
+
+    floor = items[backbone[0]]["dim7"]   # backbone suit `order` -> [0] porte le min
+    # Un item du backbone a par construction dim7 >= floor : un suspect est donc
+    # toujours hors backbone, et une ancre n'est jamais elle-même déplacée.
+    suspects = [i for i in order if items[i]["dim7"] < floor - margin]
+    if not suspects:
+        return order
+
+    before: dict[int, list[int]] = {}
+    after: dict[int, list[int]] = {}
+    for i in suspects:                   # parcouru en dim7 croissant
+        box = items[i]["box"]
+        j = _anchor(box, items, backbone)
+        side = before if box[3] <= items[j]["box"][1] else after
+        side.setdefault(j, []).append(i)
+
+    moved = set(suspects)
+    out: list[int] = []
+    for k in order:
+        if k in moved:
+            continue
+        out.extend(before.get(k, ()))
+        out.append(k)
+        out.extend(after.get(k, ()))
+    return out
+
+
+
+
+
+
+
+
+
+# Phase C — ordre de lecture : patch des dim7 incohérents (voir reading_order.py)
+READING_HI_SCORE     = 0.50   # au-dessus, dim7 fait foi (backbone de la page)
+READING_FLOOR_MARGIN = 10     # écart sous le floor à partir duquel on réancre. Calibré
+                              # sur totalenergies : 9 des 29 items sous le floor sont à
+                              # un écart <= 5 et sont correctement placés — les bouger
+                              # serait du bruit.
+
+
+
+
+
+
+
+
+
+"""Phase C — DOM builder.
+
+build_dom is a PURE function of (doc_ocr, page_dims): no I/O, no PDF, no network.
+The runner (lot 7) computes page_dims via pdf_utils.page_dims_from_pdf(pdf_path) and
+calls build_dom, then serializes the result to doc_dom.json next to doc_ocr.json.
+
+Scope so far:
+  lot 1 — document header + flat index (content/visual atoms) + per-page chrome bucket.
+  lot 2 — section tree + section_id backpointer on each atom, caption resolution
+          (figure_title/footnote adjacent — previous or next — to a visual on the same
+          page). A title-less document collapses to a single 's_toc' section.
+  lot 3 — formal ToC detection (header.toc_present / toc_atom_ids).
+  lot 4 — title levels (1-4) via an INJECTED title_leveler, then the flat section list is
+          nested by level. Without a leveler every section stays L1 (lot-2 shape).
+  lot 5 — running-head de-dup: a title reprinted at the top of every page of its section
+          opened a phantom section each time; from its second occurrence on it is now
+          demoted to chrome (see _detect_running_titles).
+
+Not yet (later lots):
+  audit sidecar ................................... later
+"""
+
+import re
+from collections.abc import Callable
+from statistics import median
+
+from config import (
+    DPI,
+    DOM_CONTENT_LABELS,
+    DOM_VISUAL_LABELS,
+    DOM_CHROME_LABELS,
+    DOM_CAPTION_LABELS,
+    DOM_TITLE_LABELS,
+)
+from dom_title_levels import assign_title_levels
+from reading_order import reading_order
+
+SCHEMA_VERSION = "1.1.0"   # 1.1.0: lot 5, header.stats.n_running_titles
+
+# Union of the three role sets = the labels we know how to route. The sets are disjoint
+# and cover the 25 PP-DocLayoutV2 labels exactly once; an unknown label makes _classify
+# raise (v1 is expected never to emit one).
+_KNOWN_LABELS = DOM_CONTENT_LABELS | DOM_VISUAL_LABELS | DOM_CHROME_LABELS
+
+
+def _classify(label):
+    """(role, visual_kind) for a label. The three role sets are disjoint; for a
+    visual atom the visual_kind IS the label (table/chart/figure/image)."""
+    if label in DOM_VISUAL_LABELS:
+        return "visual", label
+    if label in DOM_CHROME_LABELS:
+        return "chrome", None
+    if label in DOM_CONTENT_LABELS:
+        return "content", None
+    raise ValueError(f"Unknown label: {label!r}")
+
+
+def _ordered_stream(doc_ocr):
+    """Flat list of every atom in global reading order (page asc, then reading_order).
+
+    Pages are visited in sorted key order; INSIDE a page the order comes from
+    reading_order(), which keeps dim7 for the confident atoms and re-anchors the few whose
+    dim7 is incoherent with the rest of the page (see reading_order.py).
+
+    The atom_id is still assigned from the ORIGINAL per-page list index (enumerate) — ONLY
+    THEN is the permutation applied. markdown_build keys id_to_bbox on that same original
+    index and does NOT call reading_order, so the id-to-item mapping stays identical on
+    both sides whatever the permutation (see [[dom-id-parity]]): a moved atom changes
+    position in the stream, never id. Each record carries the routed role/visual_kind so
+    caption detection and grouping don't reclassify."""
+    stream = []
+    for page_key in sorted(doc_ocr, key=lambda k: int(k.split("_")[1])):
+        page = int(page_key.split("_")[1])
+        items = doc_ocr[page_key]
+        records = []
+        for idx, item in enumerate(items):
+            role, visual_kind = _classify(item["label"])
+            records.append({
+                "atom_id": f"p{page}_e{idx}",
+                "page": page,
+                "dim7": item["dim7"],
+                "item": item,
+                "label": item["label"],
+                "role": role,
+                "visual_kind": visual_kind,
+            })
+        stream.extend(records[i] for i in reading_order(items))
+    return stream
+
+
+def _detect_captions(stream):
+    """{caption_atom_id: visual_atom_id}. A figure_title/footnote atom is a caption
+    iff its PREVIOUS or NEXT content-or-visual atom on the SAME page is either a
+    visual OR an already-resolved caption of a visual (chain V -> C1 -> C2).
+    Previous wins over next when both match."""
+    adj = [a for a in stream
+           if a["role"] != "chrome" or a["label"] in DOM_CAPTION_LABELS]
+    caption_of = {}
+    for i, a in enumerate(adj):
+        if i == 0 or a["label"] not in DOM_CAPTION_LABELS:
+            continue
+
+        # Previous neighbour (priority)
+        prev = adj[i - 1]
+        if prev["page"] == a["page"]:
+            if prev["role"] == "visual":
+                caption_of[a["atom_id"]] = prev["atom_id"]
+                continue
+            if prev["atom_id"] in caption_of:
+                caption_of[a["atom_id"]] = caption_of[prev["atom_id"]]
+                continue
+
+        # Fallback: next neighbour
+        if i + 1 < len(adj):
+            nxt = adj[i + 1]
+            if nxt["page"] == a["page"] and nxt["role"] == "visual":
+                caption_of[a["atom_id"]] = nxt["atom_id"]
+
+    return caption_of
+
+
+def _detect_toc(stream):
+    """Any content atom on pages 0-4 flags the doc as having a ToC."""
+    toc_ids = []
+    for a in stream:
+        if a["page"] > 4:
+            break
+        if a["label"] == "content":
+            toc_ids.append(a["atom_id"])
+    return toc_ids
+
+
+_RUNNING_MAX_Y_REL = 0.12     # top band of the page; body titles of the corpus sit ~0.34
+_RUNNING_MIN_DENSITY = 0.8    # contiguous run; a title reused far apart scores below 0.10
+
+
+def _title_key(text):
+    """Grouping key for a title: lowercased, digit-free, whitespace-collapsed."""
+    return " ".join(re.sub(r"\d+", "", text.lower()).split())
+
+
+def _detect_running_titles(stream, page_dims):
+    """{atom_id} of the REPEATED occurrences of a running title — a title reprinted at
+    the top of each page of its section, which opens a phantom section every time. The
+    first occurrence is never returned: it IS the real section opener.
+
+    A group of title atoms sharing one key is demoted when the three conditions below
+    hold. Thresholds calibrated on the 96-document FinRAGBench-V corpus with
+    eval/title_diagnostic.py; each rejects a distinct family of false positives:
+      y_rel < 0.12     only the top band of the page, where a running head lives. Kills
+                       the titles legitimately reused in distant sections of a 10-K
+                       ("Part III", "United States"), which sit around 0.34.
+      density >= 0.8   only contiguous page runs. Kills what y_rel let through: that same
+                       reuse pattern scores below 0.10 here.
+      one raw variant  every occurrence is byte-identical. Kills captions mislabelled as
+                       titles ("Table 1"/"Table 2") and numbered siblings ("Note 12"/
+                       "Note 13"), which share a key but not a text.
+
+    The key strips digits and case even though identical raw texts are then required. That
+    is not redundant: it makes a MIXED group ("Notes" x4 plus "Notes 2") fall into a single
+    rejected group instead of an accepted group plus a singleton. Dropping it would loosen
+    the rule, not simplify it.
+
+    Measured on the corpus: 82 titles, 353 sections, 84% of them on four documents."""
+    groups = {}
+    for a in stream:
+        if a["label"] not in DOM_TITLE_LABELS:
+            continue
+        text = (a["item"].get("text") or "").strip()
+        key = _title_key(text)
+        if key:
+            groups.setdefault(key, []).append((a, text))
+
+    demoted = set()
+    for items in groups.values():
+        if len(items) < 2 or len({text for _, text in items}) > 1:
+            continue
+        pages = sorted({a["page"] for a, _ in items})
+        if len(pages) / (pages[-1] - pages[0] + 1) < _RUNNING_MIN_DENSITY:
+            continue
+        if median([a["item"]["box"][1] / page_dims[a["page"]][1]
+                   for a, _ in items]) >= _RUNNING_MAX_Y_REL:
+            continue
+        demoted.update(a["atom_id"] for a, _ in items[1:])   # stream order: [0] is first
+    return demoted
+
+
+def _route_atoms(stream, caption_of, running):
+    """Build (index, chrome). content/visual atoms and captions go to the index (a
+    caption footnote is PROMOTED from chrome to the index). Non-caption chrome atoms and
+    demoted running titles go to the per-page chrome bucket. Insertion order = global
+    reading order."""
+    index = {}
+    chrome = {}
+    for a in stream:
+        item, atom_id = a["item"], a["atom_id"]
+        is_caption = atom_id in caption_of
+
+        # A demoted running title is chrome by nature — the same head reprinted, not a new
+        # section opener. It keeps its doc_title/paragraph_title label in the bucket, so
+        # nothing is lost and the demotion stays visible.
+        if atom_id in running or (a["role"] == "chrome" and not is_caption):
+            chrome.setdefault(str(a["page"]), []).append({
+                "id": atom_id,
+                "page": a["page"],
+                "bbox": item["box"],
+                "label": a["label"],
+                "text": item.get("text", ""),
+                "role": "chrome",
+            })
+            continue
+
+        atom = {
+            "id": atom_id,
+            "page": a["page"],
+            "bbox": item["box"],
+            "label": a["label"],
+            "text": item.get("text", ""),
+            "ocr_error": item.get("ocr_error"),
+            "dim7": a["dim7"],
+            "role": "visual" if a["role"] == "visual" else "content",
+            "visual_kind": a["visual_kind"],
+            "section_id": None,   # filled by _build_sections
+        }
+        if is_caption:
+            atom["caption_of"] = caption_of[atom_id]
+        index[atom_id] = atom
+    return index, chrome
+
+
+def _new_section(section_id, title, title_id):
+    return {
+        "section_id": section_id,
+        "title": title,
+        "title_id": title_id,
+        "level": 1,
+        "level_source": "fallback",   # "llm" once a leveler overrides it (lot 4)
+        "page_start": None,           # filled by _fill_section_pages
+        "page_end": None,
+        "children": [],               # atom_ids of the section body, in reading order — EXCLUDES the title atom (referenced separately by title_id)
+        "subsections": [],            # child sections, filled by _nest_sections (lot 4)
+    }
+
+
+def _build_sections(stream, index, caption_of):
+    """Walk the index atoms in reading order and group them into L1 sections.
+
+    A title atom (doc_title/paragraph_title) opens a section unless it is a caption. The
+    opening title is referenced ONLY by the section's title_id — it is NOT placed in
+    "children"; children holds the section body (everything except the title) in reading
+    order. A figure_title never opens a section: an orphan figure_title (no visual to
+    caption) attaches to the current section as normal content. Every other atom attaches
+    to the current section; atoms appearing before any section is open land in a
+    lazily-created implicit holder 's_toc'. A title-less document therefore collapses to a
+    single 's_toc' section holding every atom. Fills section_id on each index atom (title
+    included, via title_id).
+
+    Returns (sections, first_doc_title) where first_doc_title is (atom_id, title) of the
+    first doc_title in reading order, or None."""
+    sections = []
+    current = None
+    next_sid = 0
+    first_doc_title = None
+
+    def attach(atom_id):
+        nonlocal current
+        if current is None:
+            current = _new_section("s_toc", None, None)
+            sections.append(current)
+        current["children"].append(atom_id)
+        index[atom_id]["section_id"] = current["section_id"]
+
+    for a in stream:
+        atom_id = a["atom_id"]
+        if atom_id not in index:
+            continue  # non-caption chrome: not part of any section
+
+        label = a["label"]
+        text = (a["item"].get("text") or "").strip()
+
+        if label == "doc_title" and first_doc_title is None:
+            first_doc_title = (atom_id, text or None)
+
+        is_caption = atom_id in caption_of
+        is_opener = (not is_caption) and label in {"doc_title", "paragraph_title"}
+
+        if is_opener:
+            sid = f"s{next_sid}"
+            next_sid += 1
+            current = _new_section(sid, text or None, atom_id)
+            sections.append(current)
+            index[atom_id]["section_id"] = sid   # title tracked via title_id, NOT in children
+        else:
+            attach(atom_id)
+
+    return sections, first_doc_title
+
+
+def _fill_section_pages(sections, index):
+    """Post-order walk over the nested section tree. Fills page_start / page_end on every
+    section to cover its full territory: the title atom's page (when title_id is set —
+    subsumes the old title-only fallback), the pages of its body atoms (children), and
+    recursively the intervals of all its subsections. A section with none of these keeps
+    page_start = page_end = None. Must run AFTER _nest_sections (subsections populated)."""
+    for sec in sections:
+        # the title is NOT in children (see _build_sections) — add it separately
+        own_pages = []
+        if sec["title_id"]:
+            own_pages.append(index[sec["title_id"]]["page"])
+        own_pages += [index[c]["page"] for c in sec["children"]]
+
+        _fill_section_pages(sec["subsections"], index)   # children first (post-order)
+        for sub in sec["subsections"]:
+            if sub["page_start"] is not None:
+                own_pages += [sub["page_start"], sub["page_end"]]
+
+        sec["page_start"] = min(own_pages) if own_pages else None
+        sec["page_end"] = max(own_pages) if own_pages else None
+
+
+def _apply_title_levels(sections, index, title_leveler):
+    """Set level/level_source on every section; return the header title_leveling flag.
+
+    Sections default to level 1 / "fallback" (from _new_section). If a leveler is given
+    AND there is at least one titled section (title_id set, title non-empty), the leveler
+    is called ONCE with [{title_id, text, page}, ...] in reading order. A returned pair is
+    kept only when its title_id is known and its level is an int in 1..4; those sections
+    switch to that level / "llm". Everything else stays L1 / "fallback".
+
+    Returns "skipped" (no leveler or no titled section — no call made), "llm" (leveler
+    produced at least one usable level), or "failed" (leveler returned None OR produced no
+    usable level — the silent-failure case this flag exists to catch)."""
+    titled = [s for s in sections if s["title_id"] and s["title"]]
+    if title_leveler is None or not titled:
+        return "skipped"
+
+    titles = [{"title_id": s["title_id"],
+               "text": s["title"],
+               "page": index[s["title_id"]]["page"]} for s in titled]
+    raw = title_leveler(titles)
+    if raw is None:
+        return "failed"
+
+    input_ids = {s["title_id"] for s in titled}
+    levels = {tid: lvl for tid, lvl in raw.items()
+              if tid in input_ids and isinstance(lvl, int)
+                and 1 <= lvl <= 4}
+    for s in titled:
+        if s["title_id"] in levels:
+            s["level"] = levels[s["title_id"]]
+            s["level_source"] = "llm"
+    return "llm" if levels else "failed"
+
+
+def _nest_sections(sections):
+    """Nest the flat, reading-ordered section list by level; return the top-level ones.
+
+    Monotonic-stack nesting: a section of level N is appended to the "subsections" of the
+    nearest preceding still-open section of level < N; with none open it stays top-level.
+    With every section at L1 (no leveler) this returns the flat list unchanged and leaves
+    all "subsections" empty (lot-2 shape preserved)."""
+    top = []
+    stack = []
+    for sec in sections:
+        while stack and stack[-1]["level"] >= sec["level"]:
+            stack.pop()
+        if stack:
+            stack[-1]["subsections"].append(sec)
+        else:
+            top.append(sec)
+        stack.append(sec)
+    return top
+
+
+def _assemble_tree(top_sections, page_count, first_doc_title):
+    """L0 root holding the top-level sections of the nested tree. Root title = first
+    doc_title (or null). The key is "sections" (not "children") on purpose: a section's
+    "children" are atom_ids, the root's "sections" are section objects."""
+    return {
+        "section_id": "root",
+        "title": first_doc_title[1] if first_doc_title else None,
+        "title_id": first_doc_title[0] if first_doc_title else None,
+        "level": 0,
+        "page_start": 0,
+        "page_end": max(page_count - 1, 0),
+        "sections": top_sections,
+    }
+
+
+def build_dom(doc_ocr, page_dims, doc_id=None, pdf_name=None, dpi=DPI,
+              title_leveler: Callable | None = assign_title_levels):
+    """doc_ocr {page_N: [{label, box, dim7, text, ocr_error, ...}, ...]} +
+    page_dims {page_index: (width_px, height_px)} -> doc_dom dict {header, index, chrome, tree}.
+
+    Section page_start/page_end cover the section's FULL territory: its own atoms plus all
+    its subsections recursively (a parent spans everything under it).
+
+    title_leveler: optional callable [{title_id, text, page}, ...] -> {title_id: level} (or
+    None on failure). When given, it is called ONCE to assign title levels 1-4 and the flat
+    section list is nested by level; when None, every section stays L1. NOTE: the injected
+    callable MAY do network I/O — build_dom itself stays pure, the effect is the caller's."""
+    stream = _ordered_stream(doc_ocr)
+    caption_of = _detect_captions(stream)
+    # After caption detection, which reasons on adjacency over the UNDEMOTED stream, and
+    # before _build_sections/_apply_title_levels, which then never see the phantom titles.
+    running = _detect_running_titles(stream, page_dims)
+    index, chrome = _route_atoms(stream, caption_of, running)
+    toc_atom_ids = _detect_toc(stream)
+
+    sections, first_doc_title = _build_sections(stream, index, caption_of)
+    title_leveling = _apply_title_levels(sections, index, title_leveler)
+    n_sections = len(sections)                # flat total, before nesting
+    top_sections = _nest_sections(sections)
+    _fill_section_pages(top_sections, index)  # after nesting: territory covers subsections
+
+    page_count = len(page_dims)
+    tree = _assemble_tree(top_sections, page_count, first_doc_title)
+
+    pages = [{"index": p, "width": w, "height": h}
+             for p, (w, h) in sorted(page_dims.items())]
+    n_visual = sum(1 for a in index.values() if a["role"] == "visual")
+    n_chrome = sum(len(v) for v in chrome.values())
+
+    header = {
+        "doc_id": doc_id,
+        "schema_version": SCHEMA_VERSION,
+        "source": {"doc_ocr": "doc_ocr.json", "pdf": pdf_name},
+        "dpi": dpi,
+        "coord_space": "raster_px",
+        "page_count": page_count,
+        "pages": pages,
+        "toc_present": bool(toc_atom_ids),
+        "toc_atom_ids": toc_atom_ids,
+        "title_leveling": title_leveling,
+        "stats": {
+            "n_atoms": len(index),      # content + visual + captions (chrome excluded)
+            "n_sections": n_sections,
+            "n_chrome": n_chrome,
+            "n_visual": n_visual,
+            "n_running_titles": len(running),   # demoted by lot 5; 0 = nothing matched
+        },
+    }
+
+    return {"header": header, "index": index, "chrome": chrome, "tree": tree}
+
+
+
+
+
+
+
+
+
+import sys; sys.path.insert(0, ".")
+from run_benchmark import ARTIFACTS, load_or_build_dom
+
+for d in sorted(p for p in ARTIFACTS.iterdir() if p.is_dir()):
+    pairs = [(d / "doc_dom.json", d / "doc_dom_v1.json"),
+             (d / "skeleton.xml", d / "skeleton_v1.xml")]
+    if not any(dst.exists() for _, dst in pairs):      # un v1 existe -> on n'écrase pas
+        for src, dst in pairs:
+            if src.exists():
+                src.rename(dst)
+
+    dom, _ = load_or_build_dom(d)                      # rebuild : DOM + skeleton
+    st = dom["header"]["stats"]
+    print(f"{d.name[:40]:40} sections={st['n_sections']:4}  "
+          f"running={st.get('n_running_titles', '-')}")
+
+
+
+
+
+from run_benchmark import run_benchmark, aggregate_run
+from score_results import score_results
+
+RUN = "run3_reading_order"   # nouveau run_id, sinon tu continues l'ancien
+
+# pilote d'abord : 5 queries, tu vérifies que rien ne casse
+run_benchmark(RUN, limit=5, notes="reading_order (dim7 patché) + lot 5 titres redondants")
+
+# puis tout
+run_benchmark(RUN, notes="")     # notes ignoré ici : lu seulement à la création du run
+aggregate_run(RUN)
+score_results(RUN)
+
+
+
+from analyze import load_scored, overview, quality_by
+df = load_scored(RUN)
+overview(df)
+
