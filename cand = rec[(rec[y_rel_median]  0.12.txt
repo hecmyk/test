@@ -1,0 +1,7 @@
+cand = rec[(rec["y_rel_median"] < 0.12) & (rec["density"] >= 0.8)]
+c2 = cand[cand["n_variants"] == 1]
+print("1 condition :", len(cand), "titres ->", int((cand["n_occurrences"] - 1).sum()), "sections")
+print("2 conditions:", len(c2), "titres ->", int((c2["n_occurrences"] - 1).sum()), "sections")
+print("\nn_variants sur les candidats :\n", cand["n_variants"].value_counts().head())
+print("\ndocs touchés :\n", c2.assign(dup=c2["n_occurrences"] - 1)
+        .groupby("doc_stem")["dup"].sum().sort_values(ascending=False).head(15))
