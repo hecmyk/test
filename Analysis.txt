@@ -1,0 +1,218 @@
+"""Analysis tables for one scored benchmark run.
+
+Every function takes the DataFrame returned by load_scored and returns another one;
+printing is left to the notebook. Two grouping functions cover every breakdown asked of
+the harness: cost_by answers "how much did it cost", quality_by answers "how good was it".
+Call them with "outcome", "page_ok", "category" or "answer_type".
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))          # eval/, for run_benchmark
+
+from run_benchmark import RUNS          # noqa: E402
+
+
+def load_scored(run_id: str) -> pd.DataFrame:
+    """Flat table of a run's scored rows, one row per query.
+
+    agent_metrics is flattened into top-level columns, so a row whose agent crashed (its
+    metrics hold only wall_clock_s) comes out with NaN there rather than a missing key.
+    Baseline runs (fullctx, oracle_*) don't emit the agent-only columns; they're filled
+    with neutral defaults so overview/cost_by/quality_by don't need to branch.
+
+    Args:
+        run_id: The iteration to load.
+
+    Returns:
+        The scored rows plus the derived columns the other functions group on.
+    """
+    path = RUNS / run_id / "scored.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    df = pd.json_normalize(rows)
+    df.columns = [c.replace("agent_metrics.", "").replace("tokens.", "tokens_")
+                  for c in df.columns]
+
+    # Compat baseline : les runs baseline (fullctx, oracle_*) n'ont pas les colonnes
+    # agent-only. Remplies ici avec des neutres pour que overview/cost_by/quality_by
+    # tournent sans if partout. Fallback tokens : les baselines utilisent reader_tokens.
+    _agent_only_defaults = {
+        "tokens_total": float("nan"),
+        "n_steps": float("nan"),
+        "n_get_section_calls": float("nan"),
+        "n_unique_sections_fetched": float("nan"),
+        "hit_max_iterations": float("nan"),
+        "submit_draft_source": "n/a",
+    }
+    for col, default in _agent_only_defaults.items():
+        if col not in df.columns:
+            df[col] = default
+    if "invalid_tool_args" not in df.columns:
+        df["invalid_tool_args"] = [[] for _ in range(len(df))]
+    if df["tokens_total"].isna().all() and "reader_tokens" in df.columns:
+        df["tokens_total"] = df["reader_tokens"]
+
+    # Ordered so the stronger signal wins: a crashed run is not an abstention, and an
+    # abstention is not a wrong answer even though the judge scores both 0.
+    outcome = pd.Series("wrong", index=df.index)
+    outcome[df["judge_score"] == 1] = "correct"
+    outcome[df["judge_score"].isna()] = "judge_failed"
+    outcome[df["pred_answer"].isna()] = "abstention"
+    outcome[df["error"].notna()] = "error"
+
+    df["outcome"] = outcome
+    df["page_ok"] = df["page_recall"] == 1
+    df["cited"] = df["pred_source_page"].notna()
+    df["tokens_per_step"] = df["tokens_total"] / df["n_steps"]
+    df["n_invalid"] = df["invalid_tool_args"].str.len()
+    return df
+
+
+def overview(df: pd.DataFrame) -> pd.DataFrame:
+    """Run-level rates, as a one-column table.
+
+    Args:
+        df: load_scored output.
+
+    Returns:
+        One row per statistic.
+    """
+    cited = df[df["cited"]]
+    stats = {
+        "n_queries": len(df),
+        "n_judge_failed": df["outcome"].eq("judge_failed").sum(),
+        "accuracy": df["judge_score"].mean(),
+        "token_f1": df["token_f1"].mean(),
+        "page_recall": df["page_recall"].mean(),
+        "page_recall_cited_only": cited["page_recall"].mean(),
+        "abstention_rate": (df["outcome"] == "abstention").mean(),
+        "error_rate": (df["outcome"] == "error").mean(),
+        "forced_rate": (df["submit_draft_source"] == "forced").mean(),
+        "cap_rate": df["hit_max_iterations"].mean(),
+        "rows_with_invalid": (df["n_invalid"] > 0).mean(),
+        "calls_mean": df["n_get_section_calls"].mean(),
+        "calls_median": df["n_get_section_calls"].median(),
+        "tokens_mean": df["tokens_total"].mean(),
+    }
+    return pd.DataFrame({"value": stats}).round(3)
+
+
+def cost_by(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    """Tool-call and token cost grouped by `column`, each mean beside its median.
+
+    The median and cap_rate sit next to every mean on purpose: a run that hits MAX_STEPS
+    has its call count truncated, so a group that caps often sees its mean pulled toward
+    the cap and understates the real gap. tokens_per_step is the token column that carries
+    its own signal — tokens_total is nearly collinear with the call count, since every
+    retrieved section stays in the conversation.
+
+    Args:
+        df: load_scored output, pre-filtered when the scope needs it (e.g. df[df.cited]).
+        column: Column to group on.
+
+    Returns:
+        One row per group, largest group first.
+    """
+    g = df.groupby(column)
+    table = pd.DataFrame({
+        "n": g.size(),
+        "calls_mean": g["n_get_section_calls"].mean(),
+        "calls_median": g["n_get_section_calls"].median(),
+        "unique_mean": g["n_unique_sections_fetched"].mean(),
+        "steps_mean": g["n_steps"].mean(),
+        "tokens_mean": g["tokens_total"].mean(),
+        "tokens_per_step": g["tokens_per_step"].mean(),
+        "cap_rate": g["hit_max_iterations"].mean(),
+        "invalid_rate": g["n_invalid"].apply(lambda s: (s > 0).mean()),
+        "duration_mean": g["duration_s"].mean(),
+    })
+    return table.sort_values("n", ascending=False).round(2)
+
+
+def quality_by(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    """Accuracy, page recall and abstention rate grouped by `column`.
+
+    page_recall counts an abstention as 0 by design, so page_recall_cited is given beside
+    it: without that column, "did not find the page" is dominated by rows citing none.
+
+    Args:
+        df: load_scored output.
+        column: Column to group on.
+
+    Returns:
+        One row per group, largest group first.
+    """
+    g = df.groupby(column)
+    cited = df[df["cited"]].groupby(column)
+    table = pd.DataFrame({
+        "n": g.size(),
+        "accuracy": g["judge_score"].mean(),
+        "token_f1": g["token_f1"].mean(),
+        "page_recall": g["page_recall"].mean(),
+        "page_recall_cited": cited["page_recall"].mean(),
+        "n_cited": cited.size(),
+        "abstention_rate": g["outcome"].apply(lambda s: (s == "abstention").mean()),
+        "forced_rate": g["submit_draft_source"].apply(lambda s: (s == "forced").mean()),
+    })
+    return table.sort_values("n", ascending=False).round(3)
+
+
+def invalid_calls(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per tool call the loop refused, with the shape of the id asked for.
+
+    Args:
+        df: load_scored output.
+
+    Returns:
+        Columns query_id, outcome, tool, reason, step, id, form — where form is
+        section (sN), atom (pN_eM), hybrid (sN_eM) or other.
+    """
+    calls = df["invalid_tool_args"].explode().rename("call")
+    ex = df[["query_id", "outcome"]].join(calls)
+    ex = ex[ex["call"].notna()]
+
+    ex["tool"] = ex["call"].str["tool"]
+    ex["reason"] = ex["call"].str["reason"]
+    ex["step"] = ex["call"].str["step"]
+    ex["id"] = ex["call"].str["args"].str["section_id"]
+
+    form = pd.Series("other", index=ex.index)
+    form[ex["id"].str.fullmatch(r"s\d+", na=False)] = "section"
+    form[ex["id"].str.fullmatch(r"p\d+_e\d+", na=False)] = "atom"
+    form[ex["id"].str.fullmatch(r"s\d+_e\d+", na=False)] = "hybrid"
+    ex["form"] = form
+    return ex.drop(columns="call")
+
+
+def plot_cost_by_outcome(df: pd.DataFrame) -> None:
+    """Boxplot of get_section calls per outcome, group size under each box."""
+    groups = list(df.groupby("outcome")["n_get_section_calls"])
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.boxplot([s.dropna() for _, s in groups])
+    ax.set_xticks(range(1, len(groups) + 1))
+    ax.set_xticklabels([f"{name}\nn={len(s)}" for name, s in groups])
+    ax.set_ylabel("get_section calls")
+    ax.set_title("Coût de recherche par outcome")
+    fig.tight_layout()
+
+
+def plot_recall_by_category(df: pd.DataFrame, min_n: int = 10) -> None:
+    """Bar chart of page recall per category; groups under `min_n` are dropped."""
+    table = quality_by(df, "category")
+    table = table[table["n"] >= min_n].sort_values("page_recall")
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.bar(table.index.astype(str), table["page_recall"])
+    for bar, n in zip(bars, table["n"]):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"n={n}",
+                ha="center", va="bottom", fontsize=8)
+    ax.set_ylabel("page recall")
+    ax.set_ylim(0, 1)
+    ax.set_title(f"Page recall par catégorie (n >= {min_n})")
+    fig.tight_layout()
