@@ -1,0 +1,100 @@
+import json, textwrap
+import pandas as pd
+
+COMMON = ["category", "answer_type", "question", "ground_truth", "model_answer"]
+# run_benchmark écrit gold_answer/pred_answer -> renommés si besoin
+ALIASES = {"gold_answer": "ground_truth", "pred_answer": "model_answer"}
+
+
+def _read(path):
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    df = pd.DataFrame(rows).rename(columns=ALIASES)
+    return df[["query_id"] + COMMON + ["judge_score", "judge_reasoning"]]
+
+
+def load_pair(path_gptoss, path_gemma):
+    a, b = _read(path_gptoss), _read(path_gemma)
+    if set(a.query_id) != set(b.query_id):
+        print(f"[warn] query_id non appariés : {len(set(a.query_id) ^ set(b.query_id))}")
+
+    df = a.merge(b, on="query_id", suffixes=("_gptoss", "_gemma"))
+    bad = df.model_answer_gptoss.fillna("") != df.model_answer_gemma.fillna("")
+    if bad.any():
+        raise ValueError(f"model_answer diffère sur {bad.sum()} queries "
+                         f"(ex. {df.query_id[bad].head(5).tolist()})")
+
+    for c in COMMON:
+        df[c] = df[f"{c}_gptoss"]
+    df = df.drop(columns=[f"{c}_{s}" for c in COMMON for s in ("gptoss", "gemma")])
+
+    ko_g, ko_m = df.judge_score_gptoss.isna(), df.judge_score_gemma.isna()
+    print(f"judge_failed — gpt-oss {ko_g.sum()}, gemma {ko_m.sum()}, "
+          f"les deux {(ko_g & ko_m).sum()} ; {(ko_g | ko_m).sum()} exclus sur {len(df)}")
+    df = df[~(ko_g | ko_m)].copy()
+
+    g = df["judge_score_gptoss"] = df.judge_score_gptoss.astype(int)
+    m = df["judge_score_gemma"] = df.judge_score_gemma.astype(int)
+    df["direction"] = "accord"
+    df.loc[(g == 1) & (m == 0), "direction"] = "strictier"
+    df.loc[(g == 0) & (m == 1), "direction"] = "laxiste"
+    print(f"{len(df)} queries comparables")
+    return df
+
+
+def contingency(df):
+    t = (pd.crosstab(df.judge_score_gptoss, df.judge_score_gemma)
+           .reindex(index=[0, 1], columns=[0, 1], fill_value=0)
+           .rename_axis(index="gpt-oss", columns="gemma"))
+    n = len(df)
+    po = (t.loc[0, 0] + t.loc[1, 1]) / n
+    pe = sum(t.sum(1)[k] * t.sum(0)[k] for k in (0, 1)) / n ** 2
+
+    print(f"n = {n}\n\ncounts");  print(t)
+    print("\n%");                 print((t / n * 100).round(1))
+    print(f"\naccord global : {po:.3f}   Cohen's kappa : {(po - pe) / (1 - pe):.3f}")
+    print(f"gemma_strictier (gpt-oss=1, gemma=0) : {t.loc[1, 0]}")
+    print(f"gemma_laxiste   (gpt-oss=0, gemma=1) : {t.loc[0, 1]}")
+    print(f"taux de succès — gpt-oss {df.judge_score_gptoss.mean():.3f}, "
+          f"gemma {df.judge_score_gemma.mean():.3f}")
+
+
+
+def disagreements_by(df, field):
+    out = pd.DataFrame({
+        "gemma_strictier": df[df.direction == "strictier"].groupby(field).size(),
+        "gemma_laxiste":   df[df.direction == "laxiste"].groupby(field).size(),
+        "total_queries":   df.groupby(field).size(),
+    }).fillna(0).astype(int)
+    out["total_desaccords"] = out.gemma_strictier + out.gemma_laxiste
+    return out[["gemma_strictier", "gemma_laxiste", "total_desaccords", "total_queries"]] \
+             .sort_values("total_desaccords", ascending=False)
+
+
+def dump_disagreements(df, n=10, answer_type=None, category=None, direction="both"):
+    keep = {"both": ["strictier", "laxiste"], "strictier": ["strictier"],
+            "laxiste": ["laxiste"]}[direction]
+    sub = df[df.direction.isin(keep)]
+    if answer_type: sub = sub[sub.answer_type == answer_type]
+    if category:    sub = sub[sub.category == category]
+    print(f"{len(sub)} désaccords — {min(n, len(sub))} affichés\n")
+
+    w = lambda lab, v: textwrap.fill(f"{lab:<9}: {'' if pd.isna(v) else v}",
+                                     100, subsequent_indent=" " * 11)
+    for _, r in sub.head(n).iterrows():
+        print("=" * 100)
+        print(f"{r.query_id}  |  {r.category}  |  {r.answer_type}  |  gemma_{r.direction}")
+        print("-" * 100)
+        print(w("question", r.question)); print(w("gold", r.ground_truth))
+        print(w("pred", r.model_answer))
+        print("-" * 100)
+        print(w(f"gpt-oss {r.judge_score_gptoss}", r.judge_reasoning_gptoss))
+        print(w(f"gemma   {r.judge_score_gemma}", r.judge_reasoning_gemma))
+        print()
+
+
+
+
+df = load_pair("eval/runs/<gptoss>/scored.jsonl", "eval/runs/<gemma>/scored.jsonl")
+contingency(df)
+disagreements_by(df, "answer_type")
+dump_disagreements(df, n=5, answer_type="long", direction="laxiste")
