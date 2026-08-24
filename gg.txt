@@ -1,0 +1,17 @@
+Good catch about the inconsistency: _add_usage writes tokens turn after turn, so on a mid-loop crash we ended up with tokens > 0 but n_turns = 0, phase1_time_s = 0.0 and hit_max_iterations = False. Writing those three fields just before the raise would not solve it, because the metrics dict lives in run_agent's frame and is only returned on the success path. When a raise happens, agent_runs.run_documents catches the exception and only records {doc_id, error, result: None}, so the dict is dropped anyway. Two things had to change together: (1) fill the dict even on the failure path (try/finally), and (2) surface it to the caller so it actually lands in agent_runs.json.
+
+Applied in two commits:
+
+agent.py — wrapped phase 1 and phase 2 bodies in try/finally so partial metrics (n_turns, hit_max_iterations, times, corrections trace) survive a mid-loop crash. In run_agent, wrapped the three phases in try/except and attached the metrics dict to the exception (e.metrics = metrics). Most of the diff is reindentation of the phase bodies.
+agent_runs.py + README.md — run_documents now reads partial metrics via getattr(e, "metrics", None) and includes them under the new agent key in failure entries (null when the crash precedes the agent). README updated accordingly. No behavior change on the success path.
+
+
+
+
+Commit 1 :
+
+Preserve partial agent metrics on crash (try/finally + exception attribute)
+
+Commit 2 :
+
+Record partial agent metrics in failure entries under "agent" key
