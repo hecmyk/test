@@ -1,6 +1,0 @@
-def load_pair(path_gptoss, path_gemma):
-    a, b = _read(path_gptoss), _read(path_gemma)
-    for d in (a, b):
-        d["occ"] = d.groupby("query_id").cumcount()   # query-id non unique dans le dataset
-    df = a.merge(b, on=["query_id", "occ"], suffixes=("_gptoss", "_gemma"))
-    ...
