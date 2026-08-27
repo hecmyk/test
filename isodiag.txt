@@ -1,0 +1,76 @@
+df = load_scored("iso_pilot")
+df[df["query_id"].str.startswith(("stem1", "stem2", "stem3"))][
+    ["query_id", "n_images", "error"]]
+
+
+
+
+
+
+from analyze import visual_calls
+
+agent = load_scored("run8")
+pilot = agent[agent["query_id"].isin(load_scored(RUN_ID)["query_id"])]
+visual_calls(pilot)
+
+
+
+visual_calls(pilot)["on_gold_page"].mean()
+
+
+
+
+
+
+
+
+def dump_crops(run_id: str, out_dir: str | Path) -> int:
+    """Write every crop of a finished run to disk, as the bytes that went to the model.
+
+    Reads the run's own `atom_ids` — the ids whose image was actually sent — and re-crops
+    them with the same get_visual call, which is deterministic on (atom_id, dom, pdf): the
+    PNG written here is byte-for-byte what sat in the data: URL.
+
+    Filenames carry the aiming verdict, so a directory listing is already the diagnosis:
+    `{query_id}_{atom_id}_p{page}_{GOLD|off}.png`. GOLD means the crop sits on a page the
+    dataset marks as holding the answer; the 0-/1-indexed boundary goes through
+    metrics.page_recall, never a hand-written +1.
+
+    Args:
+        run_id: A run produced by run_isolated.
+        out_dir: Directory to write into; created if absent.
+
+    Returns:
+        The number of PNGs written.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = [json.loads(line) for line in
+            (RUNS / run_id / SCORED_NAME).read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+    written = 0
+    for _stem, dom, pdf_path, doc_rows in _by_document(rows):
+        for row in doc_rows:
+            gold = row.get("gold_pages") or []
+            for atom_id in row["agent_metrics"]["atom_ids"]:
+                result = get_visual(atom_id, dom, pdf_path)
+                if "error" in result:
+                    continue
+                page = result["page"]
+                tag = "GOLD" if page_recall(page, list(gold)) == 1.0 else "off"
+                name = f"{row['query_id']}_{atom_id}_p{page}_{tag}.png"
+                (out_dir / name).write_bytes(base64.b64decode(result["image_b64"]))
+                written += 1
+
+    print(f"[{run_id}] {written} crops -> {out_dir}")
+    return written
+
+
+
+
+
+
+from isolated_visual import dump_crops
+
+dump_crops(RUN_ID, "eval/runs/crops_pilot")
