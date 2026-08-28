@@ -1,0 +1,81 @@
+import json
+from isolated_visual import _by_document, RUNS, SCORED_NAME
+
+rows = [json.loads(l) for l in
+        (RUNS / RUN_ID / SCORED_NAME).read_text(encoding="utf-8").splitlines() if l.strip()]
+
+n_vide = n_texte = 0
+for _stem, dom, _pdf, doc_rows in _by_document(rows):
+    for r in doc_rows:
+        for aid in r["agent_metrics"]["atom_ids"]:
+            if (dom["index"][aid].get("text") or "").strip():
+                n_texte += 1
+            else:
+                n_vide += 1
+print(f"{n_texte} atomes avec texte OCR, {n_vide} sans")
+
+
+
+
+
+
+
+
+dom_visual.py
+_clamp_bbox — nouveau paramètre pad, appliqué avant le clamp, et le seuil d'éligibilité dédoublé :
+
+
+def _clamp_bbox(bbox, width, height, pad: int = 0):
+    try:
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+    except (TypeError, ValueError):
+        return None
+    if x2 - x1 < _MIN_CROP_PX or y2 - y1 < _MIN_CROP_PX:   # ← AJOUT : sur la bbox BRUTE
+        return None
+
+    x1, y1, x2, y2 = x1 - pad, y1 - pad, x2 + pad, y2 + pad   # ← AJOUT
+    x1, x2 = (max(0, min(v, width)) for v in (x1, x2))
+    y1, y2 = (max(0, min(v, height)) for v in (y1, y2))
+    if x2 - x1 < _MIN_CROP_PX or y2 - y1 < _MIN_CROP_PX:   # inchangé (boîte hors page)
+        return None
+    return x1, y1, x2, y2
+
+
+
+
+
+
+get_visual — deux lignes :
+
+
+def get_visual(atom_id, dom, pdf_path, pad: int = 0):   # ← signature
+    ...
+    box = _clamp_bbox(atom["bbox"], *size, pad=pad)      
+
+
+
+
+
+eval/isolated_visual.py
+CROP_PAD_PX = 40 — constante avec le raisonnement (fixe en px, pas un %).
+pad propagé : run_isolated(..., pad=0) → run_one(..., pad) → _crops(..., pad) → get_visual(..., pad).
+Tracé deux fois : agent_metrics.crop_pad_px sur chaque ligne, et crop_pad_px dans run_metadata.json.
+dump_crops : nouveau paramètre pad, et le pad est maintenant dans le nom de fichier.
+
+
+
+# PREVIEW — pad forcé, sur les atomes d'un run existant, AUCUN appel modèle
+dump_crops("isolated_visual_from_run8", pad=40)
+# -> eval/runs/isolated_visual_from_run8/crops_pad40/
+#    acme_q12_p7_e3_p6_GOLD_pad40.png
+
+
+
+# ENREGISTREMENT — après un vrai run paddé, pad relu de chaque ligne
+run_isolated("run8", "iso_pad40", pad=40)
+dump_crops("iso_pad40")          # -> .../iso_pad40/crops/, noms en _pad40
+
+
+
+for p in (0, 40, 80, 120):
+    dump_crops("isolated_visual_from_run8", pad=p)
