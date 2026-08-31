@@ -1,0 +1,42 @@
+# --- setup ---------------------------------------------------------------
+import sys; sys.path.insert(0, "eval")          # depuis Code/ ; sinon chemin absolu
+import pandas as pd
+from analyze import load_scored, quality_by, cost_by
+
+df = load_scored("run8")
+COLS = ["n", "accuracy", "abstention_rate"]     # sous-ensemble de quality_by
+
+# --- 1. distribution tokens_total ---------------------------------------
+tok = df["tokens_total"]
+dist = tok.quantile([.5, .75, .9, .95]).rename(index=lambda q: f"p{q*100:.0f}")
+dist["max"] = tok.max()
+print(f"n={tok.notna().sum()} / {len(df)}  (NaN={tok.isna().sum()})")
+print(dist.round(0))                            # médiane == p50
+
+# --- 2. accuracy par bucket de tokens -----------------------------------
+Q = ["Q1", "Q2", "Q3", "Q4"]                    # -> ["low","mid","high"] si 3 buckets
+df["tok_bucket"], EDGES = pd.qcut(tok, len(Q), labels=Q, retbins=True)
+print({b: f"{lo:.0f}-{hi:.0f}" for b, lo, hi in zip(Q, EDGES[:-1], EDGES[1:])})
+
+# quality_by: accuracy = judge_score.mean() (les judge_failed sortent du dénominateur,
+# pas comptés comme faux). Ecart avec outcome=="correct" seulement si:
+print("judge_failed:", df["outcome"].eq("judge_failed").sum())
+print(quality_by(df, "tok_bucket").reindex(Q)[COLS])
+
+# --- 3. idem, filtré sur des catégories ----------------------------------
+CATS = ["CHA-Info", "CHA-Time", "CHA-Num"]      # labels courts (cf. CATEGORY_SHORT)
+sub = df[df["category"].isin(CATS)].copy()
+# mêmes bornes que la table 2 -> les deux tables sont comparables ligne à ligne.
+# Pour des quartiles internes au sous-ensemble: pd.qcut(sub["tokens_total"], len(Q), labels=Q)
+sub["tok_bucket"] = pd.cut(sub["tokens_total"], EDGES, labels=Q, include_lowest=True)
+print(quality_by(sub, "tok_bucket").reindex(Q)[COLS])
+
+# --- bonus ----------------------------------------------------------------
+# a) sens de la causalité: "beaucoup de tokens" = échec, ou = requête dure ?
+print(cost_by(df, "outcome")[["n", "tokens_mean", "steps_mean", "cap_rate"]])
+# b) confusion possible: les gros buckets sont-ils juste les catégories MultiPage ?
+print(pd.crosstab(df["category"], df["tok_bucket"], normalize="index").round(2))
+# c) corrélation directe, sans découpage arbitraire (point-bisérial)
+print(df["tokens_total"].corr(df["outcome"].eq("correct").astype(float)).round(3))
+
+
