@@ -1,0 +1,41 @@
+def _run_read_tool(name: str, args: dict[str, Any], pdf_path: str | Path,
+                   id_to_bbox: dict[str, tuple[int, list[int]]],
+                   ) -> tuple[str | None, str]:
+    """Execute a read tool and return its image plus the ack shown to the model.
+
+    Args:
+        name: Tool name, `get_page` or `get_crop`.
+        args: Decoded tool-call arguments.
+        pdf_path: Path to the source PDF.
+        id_to_bbox: Mapping from atom ID to `(page_index, [x1, y1, x2, y2])`.
+
+    Returns:
+        `(b64, ack)`; `b64` is None when the call failed or the tool is unknown.
+    """
+    b64 = None
+    if name == "get_page":
+        try:
+            b64 = get_page(pdf_path, args["page_index"])
+            ack = f"image returned for page {args.get('page_index')}"
+        except (KeyError, IndexError):
+            ack = f"invalid page_index {args.get('page_index')!r}"
+    elif name == "get_crop":
+        try:
+            b64 = get_crop(args["item_id"], id_to_bbox, pdf_path)
+            ack = f"image returned for {args.get('item_id')}"
+        except KeyError:
+            ack = (f"unknown id {args.get('item_id')!r} — valid ids appear in the "
+                   "markdown as [TABLE id=...] / [FIGURE id=...]")
+    else:
+        ack = f"unknown tool {name!r}"
+    return b64, ack
+
+
+
+
+
+b64, ack = _run_read_tool(name, args, pdf_path, id_to_bbox)
+
+
+
+b64, ack = _run_read_tool(tc.function.name, args, pdf_path, id_to_bbox)
