@@ -1,0 +1,174 @@
+PROMPT = (
+    "Answer the following question based on the provided image(s). Return a JSON object "
+    "with two keys:\n"
+    "- 'answer': your answer, or null if you cannot answer confidently.\n"
+    "- 'reasoning': what you see in the image(s) relevant to the question, and if you "
+    "cannot answer, explain what specifically is missing or unclear.\n"
+    "Question: {question}")
+
+
+
+def _ask(question: str, images: list[dict]) -> tuple[str | None, str | None, int]:
+    """One isolated call; `(answer, reasoning, tokens)`, both None when unusable.
+
+    `reasoning` is an analysis field only — it exists to hand-taxonomise the failure
+    modes of the abstentions (unreadable chart, information absent, missing context,
+    question misread). Nothing downstream reads it: not the judge, not the matrix.
+    """
+    # temperature/response_format follow the baselines' single-call convention, not the
+    # agent loop (which sets neither). Parsing stays defensive: response_format is
+    # advisory on this endpoint. The images carry no label — the atom id and the page
+    # would be context handed back.
+    response = client.chat.completions.create(
+        model=MISTRAL_AGENT_MODEL,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": PROMPT.format(question=question)},
+            *images,
+        ]}],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+    usage = getattr(response, "usage", None)
+    tokens = ((getattr(usage, "prompt_tokens", 0) or 0)
+              + (getattr(usage, "completion_tokens", 0) or 0))
+
+    data = _parse_reader_json((response.choices[0].message.content or "").strip())
+    if data is None:
+        return None, None, tokens
+    answer, reasoning = data.get("answer"), data.get("reasoning")
+    return ((answer if isinstance(answer, str) and answer.strip() else None),
+            (reasoning if isinstance(reasoning, str) and reasoning.strip() else None),
+            tokens)
+
+
+
+
+def run_one(row: dict, dom: dict, pdf_path: Path, pad: int = 0) -> dict:
+    """Replay one query in isolation; the row schema run_benchmark.run_one writes.
+
+    Identity columns are copied from the source row, never re-read from the dataset: the
+    two arms are joined on query_id and compared field by field, and a second read is a
+    second chance to differ.
+    """
+    started = time.perf_counter()
+    images, sent = _crops(row["atom_ids"], dom, pdf_path, pad=pad)
+    if not images:
+        answer, reasoning, tokens = None, None, 0
+        error = "no_crop: every atom id failed to re-crop"
+    else:
+        try:
+            answer, reasoning, tokens = _ask(row["question"], images)
+            error = None
+        except Exception as e:
+            answer, reasoning, tokens, error = None, None, 0, f"{type(e).__name__}: {e}"
+
+    return {
+        "query_id": row["query_id"],
+        "question": row["question"],
+        "gold_answer": row["gold_answer"],
+        "gold_pages": row.get("gold_pages"),
+        "answer_type": row.get("answer_type"),
+        "category": row.get("category"),
+        "pred_answer": answer,
+        # Neither is asked of this arm. pred_source_page None means score_results writes a
+        # flat page_recall of 0.0 for every row here — structural, not a result, do not read it.
+        "pred_quote": "",
+        "pred_source_page": None,
+        "agent_metrics": {
+            "mode": "isolated_visual",
+            "source_run": row["source_run"],
+            "agent_outcome": row["agent_outcome"],
+            "atom_ids": sent,
+            "n_images": len(images),
+            # Recorded per row, not only in run_metadata: dump_crops reads it back to
+            # redraw exactly what was sent, and a frame holding two arms keeps the
+            # variable that separates them.
+            "crop_pad_px": pad,
+            "tokens_total": tokens,
+            "wall_clock_s": round(time.perf_counter() - started, 2),
+            # Analysis field: read by hand to taxonomise the abstentions. Never scored.
+            "reasoning": reasoning,
+        },
+        "error": error,
+    }
+
+
+
+def run_isolated(source_run_id: str, run_id: str, limit: int | None = None,
+                 pad: int = 0) -> Path:
+    """Replay a scored run's chart+visual queries in isolation, then score the result.
+
+    Selection: a chart category, at least one crop served, and an outcome worth comparing
+    against — abstentions included, since an agent that had the right figure and could not
+    read it is exactly the case this arm is meant to catch.
+
+    No resume mode: a re-run of the same run_id rewrites its per-document files, so use a
+    fresh run_id, which also gives the judge a fresh cache.
+
+    Args:
+        source_run_id: The agent run to replay, e.g. "run8".
+        run_id: Name of this arm's run, e.g. "isolated_visual_from_run8".
+        limit: Stop after N queries in total (pilot runs); None replays them all.
+        pad: Crop margin in raster px (see CROP_PAD_PX). 0, the default, reproduces the
+            tight-crop arm. The A/B is padded-vs-tight ISOLATED, never padded-vs-agent:
+            one variable at a time.
+
+    Returns:
+        Path of the scored JSONL.
+    """
+    rows = [json.loads(line) for line in
+            (RUNS / source_run_id / SCORED_NAME).read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+    selected = []
+    for row in rows:
+        metrics = row.get("agent_metrics") or {}
+        outcome = _outcome(row)
+        # Chart-* is the raw label the log holds; analyze abbreviates it at load time only.
+        if not (row.get("category") or "").startswith("Chart-"):
+            continue
+        if not metrics.get("n_get_visual_calls"):
+            continue
+        if outcome not in ("correct", "wrong", "abstention"):
+            continue
+        # Deduplicated in first-call order: a repeat was answered from the loop's cache and
+        # produced no second image. Refused ids stay in and are dropped by _crops.
+        atom_ids = list(dict.fromkeys(metrics.get("get_visual_calls") or []))
+        selected.append({**row, "atom_ids": atom_ids, "agent_outcome": outcome,
+                         "source_run": source_run_id})
+    if limit is not None:
+        selected = selected[:limit]
+
+    run_dir = RUNS / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_metadata.json").write_text(json.dumps({
+        "run_id": run_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "notes": (f"isolated visual ablation of {source_run_id}: the crops get_visual "
+                  "served, re-asked with no skeleton, no tool history and no system "
+                  "prompt. judge_score is the only comparable metric."),
+        "source_run": source_run_id,
+        "model": MISTRAL_AGENT_MODEL,
+        "prompt": PROMPT,
+        "crop_pad_px": pad,
+        "n_selected": len(selected),
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"[{run_id}] {len(selected)} queries sélectionnées dans {source_run_id}")
+
+    for stem, dom, pdf_path, doc_rows in _by_document(selected):
+        with (run_dir / f"{stem}.jsonl").open("w", encoding="utf-8") as out:
+            for row in tqdm(doc_rows, desc=stem, unit="q"):
+                out.write(json.dumps(run_one(row, dom, pdf_path, pad=pad),
+                                     ensure_ascii=False) + "\n")
+                out.flush()
+
+    return score_results(run_id)
+
+
+
+df = load_scored(RUN_ID)
+with pd.option_context("display.max_rows", None, "display.max_colwidth", 300):
+    display(df[df["outcome"] == "abstention"][["query_id", "question", "reasoning"]])
+
+
