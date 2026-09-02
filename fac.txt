@@ -1,0 +1,14 @@
+"""sys.path pour les notebooks de ce dossier : eval/finragbench/, eval/, racine repo."""
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+for _p in (_HERE, _HERE.parent, _HERE.parents[1]):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+
+
+cd eval/finragbench && python -c "import _path, run_benchmark, score_results, isolated_visual, title_diagnostic; print('imports ok')"
+cd ..              && python -c "import analyze; print(analyze.RUNS, analyze.RUNS.is_dir())"
+cd ..              && python -c "from eval.baselines.reader import ARTIFACTS; print(ARTIFACTS, ARTIFACTS.is_dir())"
