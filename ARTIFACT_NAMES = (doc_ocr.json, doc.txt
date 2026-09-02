@@ -1,0 +1,63 @@
+ARTIFACT_NAMES = ("doc_ocr.json", "doc_dom.json", "skeleton.xml")
+
+
+def build_artifacts(docs: list[str] | None = None,
+                    limit: int | None = None) -> dict[str, list[str]]:
+    """Génère doc_ocr.json / doc_dom.json / skeleton.xml dans mmlongbench/artifacts/{stem}/.
+
+    Même contrat que artifacts_finrag : un document dont les trois fichiers sont déjà là
+    est sauté, donc l'appel est reprenable après un crash sans rien repayer.
+
+    Args:
+        docs: Stems à traiter, dans cet ordre. None = tous les PDFs du dataset.
+        limit: S'arrête après N documents effectivement traités (les déjà-faits ne
+            comptent pas). None = tout.
+
+    Returns:
+        `{"already", "done", "errors"}`, chaque valeur une liste de stems (`errors`
+        porte "stem: Type: message").
+    """
+    if docs is None:
+        pdfs = sorted(MM_DOCS.glob("*.pdf"))
+    else:
+        pdfs = [MM_DOCS / f"{stem}.pdf" for stem in docs]
+        missing = [p.name for p in pdfs if not p.exists()]
+        assert not missing, f"PDFs introuvables : {missing}"
+
+    already, done, errors = [], [], []
+    bar = tqdm(pdfs, unit="doc")
+    for pdf in bar:
+        stem = pdf.stem
+        bar.set_postfix_str(stem[:40])
+        out_dir = ARTIFACTS / stem
+
+        # Filet anti-crash : les trois fichiers doivent être là, sinon on refait le doc.
+        if all((out_dir / n).exists() for n in ARTIFACT_NAMES):
+            already.append(stem)
+            continue
+
+        try:
+            _, _, doc_ocr, _ = process_pipeline(pdf, WORK, save_intermediate=True)
+            dom = build_dom(doc_ocr, page_dims_from_pdf(pdf),
+                            doc_id=stem, pdf_name=pdf.name)
+            skeleton = build_outline_xml(dom)
+
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "doc_ocr.json").write_text(
+                json.dumps(doc_ocr, ensure_ascii=False), encoding="utf-8")
+            (out_dir / "doc_dom.json").write_text(
+                json.dumps(dom, ensure_ascii=False), encoding="utf-8")
+            (out_dir / "skeleton.xml").write_text(skeleton, encoding="utf-8")
+            done.append(stem)
+        except Exception as e:
+            errors.append(f"{stem}: {type(e).__name__}: {e}")
+            continue
+
+        if limit is not None and len(done) >= limit:
+            break
+
+    summary = {"already": already, "done": done, "errors": errors}
+    print({k: len(v) for k, v in summary.items()})
+    for e in errors:
+        print("  ERREUR", e)
+    return summary
