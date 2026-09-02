@@ -1,0 +1,273 @@
+import _path                                    # racine repo + eval/ + eval/finragbench/
+HERE = Path(_path.__file__).resolve().parent    # eval/finragbench/
+REPO = HERE.parents[1]
+ARTIFACTS = HERE / "artifacts"
+WORK = HERE / "_work"
+
+
+
+"""sys.path pour les notebooks de ce dossier : eval/mmlongbench/, eval/, racine repo.
+
+Les notebooks vivent a cote des modules du banc, mais importent aussi la couche
+partagee (analyze, metrics, judges) et le code racine (config, dom_*). Jupyter ne
+met que le dossier du notebook sur sys.path : ce shim ajoute les deux autres.
+Usage : `import _path` en tete de premiere cellule.
+"""
+
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+for _p in (_HERE, _HERE.parent, _HERE.parents[1]):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+
+
+
+
+import json
+from collections import Counter
+from pathlib import Path
+
+import fitz
+import pandas as pd
+from tqdm.auto import tqdm
+
+import _path                                    # racine repo + eval/ + eval/mmlongbench/
+
+HERE = Path(_path.__file__).resolve().parent    # eval/mmlongbench/
+REPO = HERE.parents[1]
+
+from pipeline import process_pipeline
+from dom_build import build_dom
+from dom_render import build_outline_xml
+from pdf_utils import page_dims_from_pdf
+
+MM_ROOT = Path.home() / "docfactory" / "data" / "MMLongBench-Doc"
+MM_DOCS = MM_ROOT / "data" / "documents"
+SAMPLES = MM_ROOT / "data" / "samples.json"
+
+ARTIFACTS = HERE / "artifacts"
+WORK = HERE / "_work"
+
+for p in (MM_DOCS, SAMPLES):
+    assert p.exists(), f"introuvable : {p}"
+ARTIFACTS.mkdir(exist_ok=True)
+WORK.mkdir(exist_ok=True)
+print(f"{len(list(MM_DOCS.glob('*.pdf')))} PDFs | artifacts -> {ARTIFACTS}")
+
+
+
+
+
+
+
+
+def load_samples() -> list[dict]:
+    """Les 1082 questions, chacune enrichie d'un query_id positionnel stable.
+
+    samples.json ne porte aucun identifiant, et (doc_id, question) n'est unique qu'à
+    1081/1082 : l'index dans le fichier est la seule clé sûre.
+
+    Returns:
+        Les samples, avec `stem` et `query_id` ajoutés.
+    """
+    samples = json.loads(SAMPLES.read_text(encoding="utf-8"))
+    for i, s in enumerate(samples):
+        s["stem"] = s["doc_id"][:-4] if s["doc_id"].endswith(".pdf") else s["doc_id"]
+        s["query_id"] = f"{s['stem']}__{i:04d}"
+    return samples
+
+
+def doc_registry() -> pd.DataFrame:
+    """Une ligne par document : type, pages, géométrie, nombre de questions.
+
+    Lit les rect de page sans rasteriser, donc quelques secondes sur les 135 documents.
+    `orient` est la variable de stratification qui compte : 27% du corpus est en paysage
+    (decks SlideShare), là où FinRAGBench-V est intégralement portrait.
+
+    Returns:
+        DataFrame indexé par stem, trié par doc_type puis pages.
+    """
+    samples = load_samples()
+    doc_type = {s["stem"]: s["doc_type"] for s in samples}
+    n_q = Counter(s["stem"] for s in samples)
+
+    rows = []
+    for stem, dtype in doc_type.items():
+        doc = fitz.open(MM_DOCS / f"{stem}.pdf")
+        rect, n_pages = doc[0].rect, doc.page_count
+        doc.close()
+        w, h = round(rect.width), round(rect.height)
+        rows.append({"stem": stem, "doc_type": dtype, "pages": n_pages,
+                     "w": w, "h": h, "orient": "paysage" if w > h else "portrait",
+                     "n_questions": n_q[stem]})
+    return pd.DataFrame(rows).set_index("stem").sort_values(["doc_type", "pages"])
+
+
+# Échantillon de sanity : les 7 domaines, les deux géométries, les deux extrêmes de
+# longueur. mmdetection (468 p) est EN DERNIER — il pèse à lui seul la moitié des pages
+# de l'échantillon, donc `limit=7` fait tourner les sept autres et le laisse de côté.
+SANITY_DOCS = [
+    "f8d3a162ab9507e021d83dd109118b60",                                       # Admin      17p portrait
+    "2023.acl-long.386",                                                      # Academic   24p A4
+    "camry_ebrochure",                                                        # Brochure   26p portrait
+    "q1-2023-bilibili-inc-investor-presentation",                             # Financial  27p 16:9
+    "indonesiamobilemarketresearch-ag-150106055934-conversion-gate02_95",     # Research   38p 4:3
+    "Sinopolis-Chengdu",                                                      # Guidebook  96p paysage
+    "digitalmeasurementframework22feb2011v6novideo-110221233835-phpapp01_95",  # Tutorial 196p 4:3
+    "mmdetection-readthedocs-io-en-v2.18.0",                                  # Guidebook 468p portrait
+]
+
+
+
+
+
+
+ARTIFACT_NAMES = ("doc_ocr.json", "doc_dom.json", "skeleton.xml")
+
+
+def build_artifacts(docs: list[str] | None = None, limit: int | None = None,
+                    max_pages: int | None = None) -> dict[str, list[str]]:
+    """Génère doc_ocr.json / doc_dom.json / skeleton.xml dans mmlongbench/artifacts/{stem}/.
+
+    Même contrat que artifacts_finrag : un document dont les trois fichiers sont déjà là
+    est sauté, donc l'appel est reprenable après un crash sans rien repayer.
+
+    Args:
+        docs: Stems à traiter, dans cet ordre. None = tous les PDFs du dataset.
+        limit: S'arrête après N documents effectivement traités (les déjà-faits et les
+            skips oversize ne comptent pas). None = tout.
+        max_pages: Documents plus longs sautés et listés dans `oversize`. None = pas de
+            limite.
+
+    Returns:
+        `{"already", "done", "oversize", "errors"}`, chaque valeur une liste de stems
+        (`errors` porte "stem: Type: message").
+    """
+    if docs is None:
+        pdfs = sorted(MM_DOCS.glob("*.pdf"))
+    else:
+        pdfs = [MM_DOCS / f"{stem}.pdf" for stem in docs]
+        missing = [p.name for p in pdfs if not p.exists()]
+        assert not missing, f"PDFs introuvables : {missing}"
+
+    already, done, oversize, errors = [], [], [], []
+    bar = tqdm(pdfs, unit="doc")
+    for pdf in bar:
+        stem = pdf.stem
+        bar.set_postfix_str(stem[:40])
+        out_dir = ARTIFACTS / stem
+
+        # Filet anti-crash : les trois fichiers doivent être là, sinon on refait le doc.
+        if all((out_dir / n).exists() for n in ARTIFACT_NAMES):
+            already.append(stem)
+            continue
+
+        if max_pages is not None:
+            doc = fitz.open(pdf)
+            n_pages = doc.page_count
+            doc.close()
+            if n_pages > max_pages:
+                oversize.append(f"{stem} ({n_pages}p)")
+                continue
+
+        try:
+            _, _, doc_ocr, _ = process_pipeline(pdf, WORK, save_intermediate=True)
+            dom = build_dom(doc_ocr, page_dims_from_pdf(pdf),
+                            doc_id=stem, pdf_name=pdf.name)
+            skeleton = build_outline_xml(dom)
+
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "doc_ocr.json").write_text(
+                json.dumps(doc_ocr, ensure_ascii=False), encoding="utf-8")
+            (out_dir / "doc_dom.json").write_text(
+                json.dumps(dom, ensure_ascii=False), encoding="utf-8")
+            (out_dir / "skeleton.xml").write_text(skeleton, encoding="utf-8")
+            done.append(stem)
+        except Exception as e:
+            errors.append(f"{stem}: {type(e).__name__}: {e}")
+            continue
+
+        if limit is not None and len(done) >= limit:
+            break
+
+    summary = {"already": already, "done": done, "oversize": oversize, "errors": errors}
+    print({k: len(v) for k, v in summary.items()})
+    for e in errors:
+        print("  ERREUR  ", e)
+    for o in oversize:
+        print("  OVERSIZE", o)
+    return summary
+
+
+
+
+
+
+
+
+def _tree_depth(sections: list[dict], depth: int = 1) -> int:
+    """Niveau d'imbrication le plus profond atteint (1 = arbre plat)."""
+    return max((_tree_depth(s["subsections"], depth + 1)
+                for s in sections if s["subsections"]), default=depth)
+
+
+def sanity_report(stems: list[str] | None = None) -> pd.DataFrame:
+    """Le tableau go/no-go : ce que la passe DOM a produit, document par document.
+
+    Ne rejoue rien et ne juge aucune réponse — lit les artifacts sur disque et sort les
+    chiffres qui révèlent un failure mode systémique. Le motif recherché est un deck
+    paysage à ~1 section par page, toutes restées à level 1 (`depth` == 1 avec
+    `leveling` != "llm"), et un squelette qui explose en tokens.
+
+    Args:
+        stems: Documents à inspecter. None = tout ce qui est dans artifacts/.
+
+    Returns:
+        DataFrame indexé par stem, joint au doc_registry.
+    """
+    if stems is None:
+        stems = sorted(p.parent.name for p in ARTIFACTS.glob("*/doc_dom.json"))
+
+    rows = []
+    for stem in stems:
+        dom = json.loads((ARTIFACTS / stem / "doc_dom.json").read_text(encoding="utf-8"))
+        xml = (ARTIFACTS / stem / "skeleton.xml").read_text(encoding="utf-8")
+        index, stats = dom["index"], dom["header"]["stats"]
+
+        captioned = {a["caption_of"] for a in index.values() if a.get("caption_of")}
+        visuals = [a for a in index.values() if a["role"] == "visual"]
+
+        rows.append({
+            "stem": stem,
+            "n_sections": stats["n_sections"],            # plat, avant nesting
+            "sec_par_page": round(stats["n_sections"] / dom["header"]["page_count"], 2),
+            "depth": _tree_depth(dom["tree"]["sections"]),
+            "leveling": dom["header"]["title_leveling"],   # llm / failed / skipped
+            "skel_ktok": round(len(xml) / 4 / 1000, 1),    # même estimation que dom_render
+            "n_visuels": len(visuals),
+            "sans_caption": round(sum(1 for v in visuals if v["id"] not in captioned)
+                                  / len(visuals), 2) if visuals else None,
+            "running_titles": stats["n_running_titles"],
+            "toc": dom["header"]["toc_present"],
+        })
+
+    report = pd.DataFrame(rows).set_index("stem")
+    meta = doc_registry()[["doc_type", "pages", "orient", "n_questions"]]
+    return meta.join(report, how="right").sort_values(["orient", "pages"])
+
+
+
+
+
+doc_registry().groupby(["doc_type", "orient"]).agg(docs=("pages","size"), pages=("pages","sum"))
+build_artifacts(SANITY_DOCS, limit=7)        # 424 pages, mmdetection laissé de côté
+sanity_report(SANITY_DOCS[:7])
+
+
+
+
+
+
