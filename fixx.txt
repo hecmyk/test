@@ -1,0 +1,21 @@
+import time
+from openai import OpenAI
+from config import MISTRAL_AGENT_MODEL, MISTRAL_API_KEY, MISTRAL_BASE_URL
+
+client = OpenAI(base_url=MISTRAL_BASE_URL, api_key=MISTRAL_API_KEY, max_retries=0)
+FILLER = "The quick brown fox jumps over the lazy dog. "   # ~11 tokens
+
+for n_tokens in (500, 2000, 5000, 10000, 20000, 40000):
+    padding = FILLER * (n_tokens // 11)
+    started = time.perf_counter()
+    try:
+        r = client.chat.completions.create(
+            model=MISTRAL_AGENT_MODEL, max_tokens=16,
+            messages=[{"role": "user", "content": padding + "\n\nReply with the word OK."}])
+        used = getattr(r, "usage", None)
+        print(f"~{n_tokens:6d} tok  OK     {time.perf_counter()-started:5.2f}s  "
+              f"prompt_tokens={getattr(used, 'prompt_tokens', '?')}")
+    except Exception as e:
+        print(f"~{n_tokens:6d} tok  ECHEC  {time.perf_counter()-started:5.2f}s  "
+              f"{type(e).__name__}: {str(e)[:160]}")
+    time.sleep(5)      # on teste la TAILLE, pas le debit
