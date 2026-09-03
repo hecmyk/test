@@ -1,0 +1,8 @@
+from run_mm import run_mm
+from extract import extract_run
+from score_mm import score_run, sanity_counters
+
+run_mm("pilot_01", limit=10, notes="pilote 10 questions bout en bout")
+extract_run("pilot_01")
+score_run("pilot_01")
+sanity_counters("pilot_01")
