@@ -1,0 +1,90 @@
+import _path                      # racine repo + eval/ + eval/mmlongbench/ sur sys.path
+
+import time
+
+from openai import OpenAI
+
+from config import MISTRAL_AGENT_MODEL, MISTRAL_API_KEY, MISTRAL_BASE_URL
+
+client = OpenAI(base_url=MISTRAL_BASE_URL, api_key=MISTRAL_API_KEY)
+
+QUESTION = ("Revenue was 1375500 in fiscal 2023, on page 3 of the document. "
+            "Call submit_draft with the answer.")
+
+ANSWER = {"type": ["string", "null"], "description": "The answer to the question."}
+QUOTE = {"type": ["string", "null"], "description": "Verbatim substring supporting it."}
+
+
+def build_tool(props):
+    """Le MEME emboitement que build_submit_draft_tool : fields -> qa -> proprietes."""
+    return {"type": "function", "function": {
+        "name": "submit_draft",
+        "description": ("Submit the extracted values for all fields. Call this exactly "
+                        "once, when you have read everything you need."),
+        "parameters": {
+            "type": "object", "additionalProperties": False, "required": ["fields"],
+            "properties": {"fields": {
+                "type": "object", "additionalProperties": False, "required": ["qa"],
+                "properties": {"qa": {
+                    "type": "object", "additionalProperties": False,
+                    "description": "Answer the question grounded in the document.",
+                    "properties": props, "required": list(props),
+                }},
+            }},
+        },
+    }}
+
+
+def probe(props, label):
+    """Un appel. props=None -> aucun tools envoye (le cas de reference)."""
+    kwargs = {} if props is None else {"tools": [build_tool(props)]}
+    started = time.perf_counter()
+    try:
+        response = client.chat.completions.create(
+            model=MISTRAL_AGENT_MODEL,
+            messages=[{"role": "user", "content": QUESTION}],
+            **kwargs,
+        )
+        elapsed = time.perf_counter() - started
+        message = response.choices[0].message
+        calls = message.tool_calls or []
+        if calls:
+            out = f"tool_call {calls[0].function.arguments}"
+        else:
+            out = f"pas de tool_call, content={(message.content or '')[:120]!r}"
+        print(f"{label}  OK    {elapsed:5.2f}s  {out}")
+    except Exception as e:
+        elapsed = time.perf_counter() - started
+        print(f"{label}  ECHEC {elapsed:5.2f}s  {type(e).__name__}")
+        print(f"    {e}")
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status is not None:
+            print(f"    status_code = {status}")
+        body = getattr(e, "body", None)
+        if body is not None:
+            print(f"    body = {body}")
+
+
+print(f"modele = {MISTRAL_AGENT_MODEL!r}   base_url = {MISTRAL_BASE_URL!r}\n")
+
+probe(None, "1. sans tools     ")
+probe({"answer": ANSWER, "quote": QUOTE,
+       "source_page": {"type": ["integer", "null"],
+                       "description": "Page the quote sits on."}},
+      "2. scalaire       ")
+probe({"answer": ANSWER, "quote": QUOTE,
+       "source_pages": {"type": "array", "items": {"type": "integer"},
+                        "description": "Pages the answer was read from."}},
+      "3. array + items  ")
+probe({"answer": ANSWER, "quote": QUOTE,
+       "source_pages": {"type": "array",
+                        "description": "Pages the answer was read from, as integers."}},
+      "4. array sans items")
+
+
+
+
+import json
+for r in (json.loads(l) for l in open("runs/<run_id>/all.jsonl", encoding="utf-8")):
+    if r["error"]:
+        print(r["query_id"][-8:], r["agent_metrics"].get("wall_clock_s"), "|", r["error"])
