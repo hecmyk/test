@@ -1,0 +1,15 @@
+import hashlib
+from pathlib import Path
+for f in ["dom_tools.py", "dom_prompts.yaml", "dom_agent.py", "eval/metrics.py",
+          "eval/analyze.py", "eval/finragbench/run_benchmark.py",
+          "eval/finragbench/score_results.py", "eval/finragbench/isolated_visual.py"]:
+    b = Path(f).read_bytes()
+    print("%-42s %6d lignes %6d octets  %s" % (f, b.count(b"\n"), len(b),
+                                               hashlib.sha256(b).hexdigest()[:16]))
+
+
+
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+logging.getLogger("openai._base_client").setLevel(logging.INFO)
+logging.getLogger("httpx").setLevel(logging.INFO)
