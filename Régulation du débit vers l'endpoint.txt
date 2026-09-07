@@ -1,0 +1,248 @@
+"""Régulation du débit vers l'endpoint DataCamp, partagée par les harnais d'évaluation.
+
+Le plafond mesuré est en TOKENS par minute (~95k), pas en requêtes : au moment des 429
+sondés, 0 requête était en vol et la fenêtre glissante portait 91k à 98k tokens. On espace
+donc les appels proportionnellement à ce qu'ils ont RÉELLEMENT coûté, lu sur
+`usage.prompt_tokens` après coup — jamais sur une estimation en caractères, qu'un crop
+base64 de get_visual gonflerait d'un facteur cent.
+
+Tout est séquentiel : un seul appelant à la fois, donc ni verrou ni fenêtre partagée.
+
+NE SONT PAS COUVERTS par ce module — ces clients appellent l'endpoint en direct, et
+repartiront en 429 tant qu'ils n'auront pas le même traitement :
+    agent.py, dom_title_levels.py, eval/judges.py (appelé par
+    eval/finragbench/score_results.py sur 8 threads), eval/baselines/reader.py,
+    eval/finragbench/isolated_visual.py.
+"""
+
+import json
+import logging
+import random
+import time
+from pathlib import Path
+
+from openai import (APIConnectionError, APIStatusError, APITimeoutError,
+                    InternalServerError, RateLimitError)
+
+TPM_BUDGET = 50_000     # ~53% du plafond mesuré : marge pour les autres locataires
+TIMEOUT_S = 120         # par appel ; sans lui le défaut du SDK est 600 s
+MAX_RETRIES = 4
+BACKOFF_BASE = 5        # secondes, doublées à chaque tentative
+
+FAILURES_NAME = "failures.jsonl"
+
+logger = logging.getLogger(__name__)
+
+# Un échec d'infrastructure n'est pas un résultat de mesure : la question est rejouable.
+# 401 et 403 en sont volontairement absents — ils échoueraient identiquement sur toutes les
+# questions suivantes, donc ils doivent remonter et arrêter le run, pas remplir un journal.
+INFRA_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)
+
+
+def is_infra_failure(exc: BaseException) -> bool:
+    """Vrai si l'échec vient de l'endpoint et non de l'agent."""
+    return isinstance(exc, INFRA_ERRORS) or (
+        isinstance(exc, APIStatusError) and exc.status_code >= 500)
+
+
+def call_with_retry(create_fn, **kwargs):
+    """Un appel LLM régulé : espacé sur son coût réel, réessayé sur 429.
+
+    Args:
+        create_fn: Le `chat.completions.create` du client appelant.
+        **kwargs: Ses arguments, transmis tels quels.
+
+    Returns:
+        La réponse du SDK.
+
+    Raises:
+        RateLimitError: Après MAX_RETRIES tentatives infructueuses.
+    """
+    kwargs.setdefault("timeout", TIMEOUT_S)
+    for attempt in range(MAX_RETRIES):
+        started = time.time()
+        try:
+            response = create_fn(**kwargs)
+        except RateLimitError:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            delay = BACKOFF_BASE * 2 ** attempt + random.uniform(0, 5)
+            logger.warning("429 — tentative %d/%d, nouvel essai dans %.1fs",
+                           attempt + 1, MAX_RETRIES, delay)
+            time.sleep(delay)
+            continue
+        # Espacement a posteriori : le prochain départ est à tokens/débit du précédent,
+        # LATENCE DÉDUITE. Sans cette déduction l'intervalle vaut latence + attente et le
+        # débit réalisé tombe d'un tiers, soit quatre heures de plus sur un run de dix.
+        used = getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0
+        time.sleep(max(0.0, used / (TPM_BUDGET / 60) - (time.time() - started)))
+        return response
+
+
+def log_failure(run_dir: Path, query_id: str, exc: BaseException) -> None:
+    """Journalise un échec d'infrastructure hors de all.jsonl, donc rejouable.
+
+    Args:
+        run_dir: Le dossier du run.
+        query_id: La question perdue.
+        exc: L'exception qui l'a fait perdre.
+    """
+    line = {"query_id": query_id, "error": f"{type(exc).__name__}: {exc}",
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    with (run_dir / FAILURES_NAME).open("a", encoding="utf-8") as f:
+        f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    logger.warning("%s perdue (infra), rejouable à la reprise : %s",
+                   query_id, type(exc).__name__)
+
+
+
+agent_dom.py — 1 import, 2 sites
+
+from eval.rate_limit import call_with_retry
+inséré après l'import dom_visual. Vérifié : eval/ est un package d'espace de noms PEP 420 (pas de __init__.py, mais importlib le trouve), et la racine du repo est déjà sur sys.path puisque agent_dom importe config.
+
+Les deux sites deviennent :
+
+
+    response = call_with_retry(
+        client.chat.completions.create,
+        model=model,
+        messages=messages,
+        tools=[submit_tool],
+        tool_choice={"type": "function", "function": {"name": SUBMIT_DRAFT}},
+    )
+
+        response = call_with_retry(
+            client.chat.completions.create,
+            model=model, messages=messages, tools=tools,
+        )
+
+
+
+
+
+eval/mmlongbench/extract.py — plus que ce que tu demandais
+max_workers passe de 8 à 1, l'appel est enveloppé, et j'ai ajouté un garde que ta spec ne couvrait pas : _call_extractor attrapait Exception et renvoyait "Failed", valeur ensuite écrite dans extracted.jsonl et gelée comme faite par le filtre de reprise sur query_id. C'est exactement le piège que tu as déclaré non-négociable côté runner, transposé à l'extracteur.
+
+
+    except Exception as e:
+        # Same rule as the runners: an endpoint failure is not a measurement. "Failed" is
+        # cached in extracted.jsonl and frozen as done by the resume filter, so letting an
+        # infra failure take that path would lose the row permanently. It propagates
+        # instead: the rows already written are kept, the rest replays on the next call.
+        if is_infra_failure(e):
+            raise
+        logger.warning("extractor call failed: %s: %s", type(e).__name__, e)
+        return "Failed"
+"Failed" reste le comportement pour tout le reste, conformément au protocole officiel.
+
+
+
+
+
+
+
+run_mm.py et run_benchmark.py — quatre points chacun, dont un hors spec
+Imports : from eval.rate_limit import FAILURES_NAME, is_infra_failure, log_failure et from openai import BadRequestError.
+
+run_one n'attrape plus que l'échec agent :
+
+
+    except BadRequestError as e:
+        answer, metrics, error = {}, {}, f"{type(e).__name__}: {e}"
+La boucle d'écriture classe le reste :
+
+
+                try:
+                    row = run_one(dom, skeleton, sample, pdf_path)
+                except Exception as e:
+                    if not is_infra_failure(e):
+                        raise
+                    log_failure(run_dir, sample["query_id"], e)
+                    continue
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                out.flush()
+
+
+
+
+
+logging.basicConfig(level=logging.WARNING, force=True) 
+
+
+
+
+
+
+
+def _strata(sample: dict) -> tuple[str, tuple[str, ...]]:
+    """La strate d'une question : (answerability, sources de preuve triées).
+
+    `evidence_pages` et `evidence_sources` sont des CHAÎNES dans samples.json
+    ("[5]", "['Chart']"), d'où le literal_eval — c'est aussi pourquoi le
+    show_results officiel les eval() lui-même.
+
+    Args:
+        sample: Une entrée de load_samples.
+
+    Returns:
+        Le couple de stratification.
+    """
+    pages = ast.literal_eval(sample["evidence_pages"])
+    answerability = ("unanswerable" if not pages else
+                     "single-page" if len(pages) == 1 else "cross-page")
+    return answerability, tuple(sorted(ast.literal_eval(sample["evidence_sources"])))
+
+
+def sample_dataset(p: float, seed: int = 42) -> list[dict]:
+    """Sous-échantillon stratifié du benchmark, à taux constant dans chaque strate.
+
+    Args:
+        p: Fraction tirée dans chaque strate, entre 0 et 1.
+        seed: Graine du tirage : un même (p, seed) redonne le même échantillon.
+
+    Returns:
+        Les questions tirées, mélangées, au format de load_samples.
+    """
+    rng = random.Random(seed)
+    everything = load_samples()
+    groups: dict[tuple, list[dict]] = {}
+    for sample in everything:
+        groups.setdefault(_strata(sample), []).append(sample)
+
+    picked = []
+    for key in sorted(groups):        # tri : le tirage ne dépend pas de l'ordre des clés
+        picked.extend(rng.sample(groups[key], round(len(groups[key]) * p)))
+    rng.shuffle(picked)
+
+    perdues = sum(1 for g in groups.values() if round(len(g) * p) == 0)
+    print(f"{len(picked)} / {len(everything)} questions ({len(picked) / len(everything):.1%}), "
+          f"{len(groups) - perdues}/{len(groups)} strates représentées")
+    for nom, cle in (("answerability", lambda s: [_strata(s)[0]]),
+                     ("evidence source", lambda s: _strata(s)[1] or ["(aucune)"])):
+        tire = Counter(x for s in picked for x in cle(s))
+        total = Counter(x for s in everything for x in cle(s))
+        print(f"  {nom}")
+        for k in sorted(total, key=lambda k: -total[k]):
+            print(f"    {k:<26} {tire[k]:>4} / {total[k]:<5} "
+                  f"{tire[k] / sum(tire.values()):6.1%} vs {total[k] / sum(total.values()):6.1%}")
+    return picked
+
+
+
+
+
+
+
+import logging
+logging.basicConfig(level=logging.WARNING, force=True)   # sinon les 429 sont invisibles
+
+import eval.mmlongbench.run_mm as rm
+from dataset import sample_dataset
+
+echantillon = sample_dataset(0.3)                        # imprime le récapitulatif
+rm.load_samples = lambda: echantillon                    # <- la ligne
+
+rm.run_mm("mm_strat30_01", notes="sous-échantillon stratifié 30% (seed 42), TPM 50k")
+
+
