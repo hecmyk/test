@@ -1,0 +1,210 @@
+"""Caractérisation du quota de l'endpoint DataCamp, par trois mesures brutes.
+
+Les appels sont ceux de DocAgent : même client, même modèle, les mêmes 4 tools, et les
+vrais messages (qa_system + qa_user_template de prompts_dom.yaml), sans temperature ni
+max_tokens — agent_dom.py n'en envoie pas. Deux écarts assumés, tous deux nécessaires à
+la mesure : max_retries=0 pour que les 429 soient visibles au lieu d'être avalés par le
+retry du SDK, et un skeleton synthétique dont on règle la taille.
+
+Chaque payload porte un nonce et un remplissage tirés au hasard : un cache de prompt côté
+gateway rendrait les gros prompts gratuits et l'expérience B ne mesurerait plus rien.
+"""
+
+import json
+import logging
+import random
+import statistics
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+REPO = next(p for p in [Path.cwd(), *Path.cwd().parents] if (p / "config.py").exists())
+sys.path.insert(0, str(REPO))
+
+import yaml
+from openai import OpenAI, RateLimitError
+
+from config import MISTRAL_AGENT_MODEL, MISTRAL_API_KEY, MISTRAL_BASE_URL
+from dom_tools import (QA_SCHEMA, build_get_section_tool, build_search_tool,
+                       build_submit_draft_tool)
+from dom_visual import build_get_visual_tool
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", force=True)
+logging.getLogger("httpx").setLevel(logging.INFO)
+
+MAX_TOKENS = None       # la prod n'en envoie pas ; mettre 512 pour plafonner le coût
+CHARS_PER_TOKEN = 3.8   # cible nominale seulement ; le vrai compte vient de usage
+OUT = Path.cwd() / "probe_results.jsonl"
+
+client = OpenAI(base_url=MISTRAL_BASE_URL, api_key=MISTRAL_API_KEY, max_retries=0)
+PROMPTS = yaml.safe_load((REPO / "prompts_dom.yaml").read_text(encoding="utf-8"))
+TOOLS = [build_get_section_tool(), build_search_tool(), build_get_visual_tool(),
+         build_submit_draft_tool({"qa": "Answer the question grounded in the document."},
+                                 QA_SCHEMA)]
+EXTRA = {} if MAX_TOKENS is None else {"max_tokens": MAX_TOKENS}
+
+# Plancher incompressible : les deux prompts et les schémas de tools partent à chaque
+# appel. Une cible en dessous de ce plancher est inatteignable, d'où la soustraction.
+BASE_TOKENS = int((len(PROMPTS["qa_system"]) + len(PROMPTS["qa_user_template"])
+                   + len(json.dumps(TOOLS))) / CHARS_PER_TOKEN)
+WORDS = ("lorem ipsum dolor sit amet consectetur adipiscing elit sed eiusmod tempor "
+         "incididunt labore dolore magna aliqua revenue segment fiscal margin table "
+         "figure appendix consolidated statement").split()
+_lock = threading.Lock()
+
+
+def messages_for(target_tokens: int) -> list[dict]:
+    """Les deux messages d'un tour d'agent, le skeleton gonflé vers target_tokens."""
+    rng = random.Random()          # non semé : deux appels ne partagent aucun contenu
+    n_words = max(20, int((target_tokens - BASE_TOKENS) * CHARS_PER_TOKEN / 6.5))
+    body = " ".join(rng.choice(WORDS) for _ in range(n_words))
+    chunks = [body[i:i + 400] for i in range(0, len(body), 400)]
+    skeleton = '<document nonce="%d">\n%s\n</document>' % (
+        rng.getrandbits(48),
+        "\n".join(f'  <section id="s{i}" pages="{i // 3}">{c}</section>'
+                  for i, c in enumerate(chunks)))
+    return [
+        {"role": "system", "content": PROMPTS["qa_system"]},
+        {"role": "user", "content": PROMPTS["qa_user_template"].format(
+            skeleton=skeleton,
+            field_definitions=json.dumps({"qa": "Answer the question."}, indent=2),
+            question="What is the consolidated revenue for the fiscal year?")},
+    ]
+
+
+def rate_headers(exc: Exception) -> dict:
+    """Retry-After et les x-ratelimit-* d'une réponse 429, s'ils existent."""
+    headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+    return {k.lower(): v for k, v in headers.items()
+            if k.lower() == "retry-after" or k.lower().startswith("x-ratelimit")}
+
+
+def one_call(rec: dict, target_tokens: int) -> dict:
+    """Un appel identique à un tour d'agent. Complète rec, le journalise, le renvoie."""
+    rec["t_start"] = time.time()
+    t0 = time.perf_counter()
+    try:
+        r = client.chat.completions.create(model=MISTRAL_AGENT_MODEL, tools=TOOLS,
+                                           messages=messages_for(target_tokens), **EXTRA)
+        rec.update(status=200, tokens_prompt=r.usage.prompt_tokens,
+                   tokens_completion=r.usage.completion_tokens)
+    except RateLimitError as e:
+        rec.update(status=429, headers=rate_headers(e))
+    except Exception as e:                      # timeout, 5xx : ne doit pas compter en 429
+        rec.update(status=type(e).__name__, detail=str(e)[:200])
+    rec["latency"] = round(time.perf_counter() - t0, 3)
+    rec["t_end"] = time.time()
+    with _lock, OUT.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    logging.info("%s #%s status=%s lat=%.2fs", rec["tag"], rec["i"], rec["status"],
+                 rec["latency"])
+    return rec
+
+
+def fire(n: int, rate: float, target_tokens: int, tag: str) -> list[dict]:
+    """n requêtes émises à `rate` req/s en boucle ouverte, puis attendues.
+
+    Un thread par requête : en boucle fermée, une latence de 6 s plafonnerait le débit
+    à 0.17 req/s et aucun des trois blocs de l'expérience A ne serait atteint.
+    """
+    pool = ThreadPoolExecutor(max_workers=min(32, max(4, n)))
+    futures, t0 = [], time.perf_counter()
+    for i in range(n):
+        wait = t0 + i / rate - time.perf_counter()
+        if wait > 0:
+            time.sleep(wait)
+        futures.append(pool.submit(one_call, {"tag": tag, "i": i, "rate_target": rate,
+                                              "tokens_target": target_tokens},
+                                   target_tokens))
+    pool.shutdown(wait=True)
+    return [f.result() for f in futures]
+
+
+def summarize(recs: list[dict]) -> tuple[float, float]:
+    """Taux de 429 et débit effectif (200 par seconde d'émission) d'un bloc."""
+    span = max(r["t_start"] for r in recs) - min(r["t_start"] for r in recs) or 1e-9
+    n_429 = sum(1 for r in recs if r["status"] == 429)
+    return n_429 / len(recs), sum(1 for r in recs if r["status"] == 200) / span
+
+
+def exp_a() -> tuple[float, dict]:
+    """Rampe : 60 s à 0.2, 0.5 puis 1.0 req/s, 90 s de repos entre blocs."""
+    out = {}
+    for k, rate in enumerate([0.2, 0.5, 1.0]):
+        if k:
+            logging.info("--- repos 90 s ---")
+            time.sleep(90)
+        out[rate] = summarize(fire(round(rate * 60), rate, 5000, f"A_{rate}"))
+        logging.info("bloc %.1f req/s : 429=%.0f%% debit_ok=%.2f req/s",
+                     rate, out[rate][0] * 100, out[rate][1])
+    clean = [r for r, (p429, _) in out.items() if p429 == 0.0]
+    return (max(clean) if clean else 0.0), out
+
+
+def exp_b(r_star: float) -> dict:
+    """Trois séries de 20 requêtes à débit constant, seuls les prompts changent.
+
+    La série 1k tombe sous BASE_TOKENS et atterrit donc au plancher : c'est le contraste
+    avec la série 30k qui discrimine, pas la valeur nominale.
+    """
+    rate = min(0.3, r_star) or 0.1
+    logging.info("=== Exp B a %.2f req/s (plancher ~%d tokens) ===", rate, BASE_TOKENS)
+    out = {}
+    for k, target in enumerate([1000, 10000, 30000]):
+        if k:
+            time.sleep(60)
+        recs = fire(20, rate, target, f"B_{target}")
+        seen = [r["tokens_prompt"] for r in recs if r["status"] == 200]
+        out[target] = (summarize(recs)[0], statistics.median(seen) if seen else None)
+        logging.info("serie %d tok : 429=%.0f%% prompt_tokens_median=%s",
+                     target, out[target][0] * 100, out[target][1])
+    return out
+
+
+def exp_c(n_reps: int = 3, poll_cap: float = 180.0) -> list[float]:
+    """Burst de 10 requêtes en 3 s, puis sonde toutes les 10 s jusqu'au premier 200."""
+    out = []
+    for rep in range(n_reps):
+        if rep:
+            logging.info("--- repos 120 s ---")
+            time.sleep(120)
+        burst = fire(10, 10 / 3, 5000, f"C{rep}_burst")
+        t_end = max(r["t_end"] for r in burst)
+        if not any(r["status"] == 429 for r in burst):
+            logging.info("rep %d : aucun 429 dans le burst, recuperation non mesurable", rep)
+            continue
+        t_first, i = None, 0
+        while t_first is None and time.time() - t_end < poll_cap:
+            time.sleep(10)
+            rec = one_call({"tag": f"C{rep}_poll", "i": i}, 500)
+            t_first, i = (rec["t_end"] if rec["status"] == 200 else None), i + 1
+        out.append(t_first - t_end if t_first else float("nan"))
+        logging.info("rep %d : t_recovery=%.1fs", rep, out[-1])
+    return out
+
+
+def main() -> None:
+    """Les trois expériences à la suite, puis le résumé chiffré."""
+    r_star, a = exp_a()
+    b = exp_b(r_star)
+    c = [t for t in exp_c() if t == t]           # NaN = plafond de sonde atteint
+
+    spread = max(p for p, _ in b.values()) - min(p for p, _ in b.values())
+    verdict = ("RPM-bound" if spread <= 0.10 else
+               "TPM-bound" if b[30000][0] > b[1000][0] else "ambigu")
+
+    print("\n=== RESULTATS ===")
+    print("Exp A : R* = %.1f req/s (taux 429 : %s)" % (r_star, ", ".join(
+        "%.1f req/s = %.0f%%" % (r, p * 100) for r, (p, _) in a.items())))
+    print("Exp B : %s -> conclusion : %s" % (", ".join(
+        "%dk tok (reel %s) = %.0f%% 429" % (t // 1000, med, p * 100)
+        for t, (p, med) in b.items()), verdict))
+    print("Exp C : t_recovery = min %.0fs / median %.0fs / max %.0fs (n=%d)"
+          % (min(c), statistics.median(c), max(c), len(c)) if c else
+          "Exp C : aucune recuperation mesuree")
+    print("logs bruts : %s" % OUT)
+
+
+main()
