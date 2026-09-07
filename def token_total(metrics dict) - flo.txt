@@ -1,0 +1,23 @@
+def token_total(metrics: dict) -> float | None:
+    """Les tokens de prompt d'une question, quel que soit le nom et la forme de la clé."""
+    for key, value in metrics.items():
+        low = key.lower()
+        if "token" in low and isinstance(value, dict):      # {"tokens": {"prompt": ...}}
+            for sub, sub_value in value.items():
+                if "prompt" in sub.lower() and isinstance(sub_value, (int, float)):
+                    return float(sub_value)
+        if "prompt" in low and "token" in low:
+            if isinstance(value, list):
+                return sum(v for v in value if isinstance(v, (int, float)))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+    return None
+
+
+
+
+    verdict = ("TPM-bound (concurrence réfutée : inflight ~0 aux rejets)"
+               if max(med_in) <= 1 else
+               "concurrence-bound" if disp_in < 0.3 <= disp_tok else
+               "TPM-bound" if disp_tok < 0.3 <= disp_in else
+               "hybride (les deux varient)")
