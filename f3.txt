@@ -1,0 +1,180 @@
+"""Trois analyses hors-ligne sur des fichiers déjà présents. Aucun appel réseau.
+
+Analyse 1 : mécanisme du quota, en relisant les 429 déjà capturés.
+Analyse 2 : ce que le serveur expose de son propre plafond dans les headers.
+Analyse 3 : les vrais n_steps / tokens des runs FinRAGBench terminés, et la matrice
+            de faisabilité qui en découle.
+"""
+
+import json
+import re
+import statistics
+from pathlib import Path
+
+REPO = next(p for p in [Path.cwd(), *Path.cwd().parents] if (p / "config.py").exists())
+PROBE = REPO / "eval" / "mmlongbench" / "probe_results.jsonl"
+FINRAG_RUNS = REPO / "eval" / "finragbench" / "runs"
+HEADER_RE = re.compile(r"^(retry-after|x-ratelimit-.*|ratelimit-.*)$", re.I)
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    """Les lignes parsables d'un JSONL ; liste vide si le fichier manque."""
+    if not path.exists():
+        print(f"[absent] {path}")
+        return []
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    if not rows:
+        print(f"[vide] {path}")
+    return rows
+
+
+def stats(values: list[float]) -> str:
+    """min / p25 / médiane / moyenne / p75 / max sur une colonne, alignés."""
+    if not values:
+        return "aucune valeur"
+    s = sorted(values)
+    q = (lambda f: s[min(len(s) - 1, int(f * len(s)))])
+    return (f"min {s[0]:>10,.0f} | p25 {q(.25):>10,.0f} | med {statistics.median(s):>10,.0f} "
+            f"| moy {statistics.fmean(s):>10,.0f} | p75 {q(.75):>10,.0f} | max {s[-1]:>10,.0f}")
+
+
+def analyse_1() -> None:
+    """Au moment de chaque 429 : combien de requêtes en vol, combien de tokens sur 60 s.
+
+    Le probe est parallèle (ThreadPoolExecutor) alors que la prod est séquentielle : le
+    `inflight` mesuré ici SURESTIME donc ce que la prod produira. C'est ce qui rend la
+    lecture asymétrique — un 429 observé à faible inflight ne peut pas s'expliquer par la
+    concurrence, donc il vaut a fortiori en prod ; un 429 à fort inflight, lui, peut être
+    un artefact du parallélisme de la sonde et ne prouve rien sur la prod.
+    """
+    print("\n=== 1. MÉCANISME DU QUOTA ===")
+    rows = read_jsonl(PROBE)
+    if not rows:
+        return
+
+    rows = [r for r in rows if "t_start" in r and "t_end" in r]
+    ok = [r for r in rows if r.get("status") == 200 and r.get("tokens_prompt")]
+    groups: dict[str, list[tuple[int, int, int]]] = {}
+    for r in rows:
+        if r.get("status") != 429:
+            continue
+        t = r["t_start"]
+        inflight = sum(1 for o in rows if o is not r and o["t_start"] <= t < o["t_end"])
+        window = [o["tokens_prompt"] for o in ok if t - 60 <= o["t_start"] <= t]
+        groups.setdefault(r["tag"][0], []).append((inflight, sum(window), len(window)))
+
+    if not groups:
+        print("aucun 429 dans le fichier — rien à discriminer")
+        return
+    for tag in sorted(groups):
+        inflight = [i for i, _, _ in groups[tag]]
+        tokens = [t for _, t, n in groups[tag] if n]
+        vides = sum(1 for _, _, n in groups[tag] if not n)
+        print(f"\ngroupe {tag}_*  ({len(groups[tag])} × 429)")
+        print(f"  inflight    {stats(inflight)}")
+        print(f"  tokens_60s  {stats(tokens)}")
+        # Un 429 dans les 60 premières secondes d'un bloc voit une fenêtre vide : son
+        # tokens_60s serait bas par construction, pas par mesure. Écarté du stat.
+        print(f"  ({vides} × 429 écartés : aucun succès dans leur fenêtre de 60 s)")
+
+    spread = (lambda vals: (max(vals) - min(vals)) / max(1.0, statistics.fmean(vals)))
+    med_in = [statistics.median([i for i, _, _ in v]) for v in groups.values()]
+    med_tok = [statistics.median([t for _, t, n in v if n]) or 0
+               for v in groups.values() if any(n for _, _, n in v)]
+    disp_in, disp_tok = spread(med_in), spread(med_tok)
+    verdict = ("concurrence-bound" if disp_in < 0.3 <= disp_tok else
+               "TPM-bound" if disp_tok < 0.3 <= disp_in else
+               "hybride (les deux varient)" if disp_in >= 0.3 else
+               "indécis (les deux sont stables — un seul régime a été sondé)")
+    print(f"\nmédianes inter-groupes : inflight {[round(m, 1) for m in med_in]} "
+          f"(dispersion {disp_in:.0%}) | tokens_60s {[round(m) for m in med_tok]} "
+          f"(dispersion {disp_tok:.0%})")
+    print(f"-> LECTURE : {verdict}")
+
+
+def analyse_2() -> None:
+    """Les clés de rate-limit que le serveur renvoie, avec leurs valeurs."""
+    print("\n=== 2. HEADERS DE RATE LIMIT ===")
+    rows = read_jsonl(PROBE)
+    if not rows:
+        return
+
+    found: dict[str, list[str]] = {}
+    for r in rows:
+        for key, value in (r.get("headers") or {}).items():
+            if HEADER_RE.match(key):
+                found.setdefault(key.lower(), []).append(str(value))
+
+    if not found:
+        print("aucun header de rate limit exposé")
+    for key, values in sorted(found.items()):
+        uniques = list(dict.fromkeys(values))[:3]
+        print(f"  {key:<34} {len(values):>5} occurrences   ex. {uniques}")
+
+    pilotable = [k for k in found if "retry-after" in k or "remaining" in k]
+    print("\n-> LECTURE : " + (
+        f"pilotage possible sur données serveur via {pilotable}" if pilotable else
+        "rien d'exploitable côté serveur, régulation à constante figée"))
+
+
+def token_total(metrics: dict) -> float | None:
+    """Les tokens de prompt d'une question, quel que soit le nom et la forme de la clé."""
+    for key, value in metrics.items():
+        low = key.lower()
+        if "prompt" in low and "token" in low:
+            if isinstance(value, list):
+                return sum(v for v in value if isinstance(v, (int, float)))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+    return None
+
+
+def analyse_3(n_questions: tuple[int, ...] = (300, 500, 1082),
+              tpms: tuple[int, ...] = (30_000, 50_000, 70_000)) -> None:
+    """Profil réel d'un run FinRAGBench terminé, puis la matrice de faisabilité."""
+    print("\n=== 3. PROFIL DES RUNS FINRAGBENCH ===")
+    runs = [d for d in FINRAG_RUNS.glob("*") if (d / "all.jsonl").exists()] \
+        if FINRAG_RUNS.exists() else []
+    if not runs:
+        print(f"[absent] aucun run avec all.jsonl sous {FINRAG_RUNS}")
+        return
+    run = max(runs, key=lambda d: (d / "all.jsonl").stat().st_mtime)
+    rows = read_jsonl(run / "all.jsonl")
+    print(f"run le plus récent : {run.name}  ({len(rows)} lignes)")
+
+    steps, tokens = [], []
+    for r in rows:
+        metrics = r.get("agent_metrics") or {}
+        if isinstance(metrics.get("n_steps"), (int, float)):
+            steps.append(float(metrics["n_steps"]))
+        total = token_total(metrics)
+        if total:
+            tokens.append(total)
+    if not steps or not tokens:
+        print(f"métriques introuvables ; clés vues : "
+              f"{sorted((rows[0].get('agent_metrics') or {}))[:12]}")
+        return
+
+    print(f"  n_steps          {stats(steps)}   (n={len(steps)})")
+    print(f"  tokens/question  {stats(tokens)}   (n={len(tokens)})")
+    med_s, med_t = statistics.median(steps), statistics.median(tokens)
+    print(f"  estimation utilisateur 3.5 tours / 100k tokens -> mesuré "
+          f"{med_s:.1f} tours / {med_t:,.0f} tokens ({med_t / med_s:,.0f} par tour)")
+
+    print("\n  faisabilité (heures) — heures = N × tokens_médians_par_question / (TPM × 60)")
+    print("    " + "N".ljust(8) + "".join(f"{t // 1000:>5}k tok/min" for t in tpms))
+    for n in n_questions:
+        cells = "".join(f"{n * med_t / (t * 60):>12.1f}" for t in tpms)
+        print(f"    {n:<8}{cells}")
+    print("  (>24 h = infaisable en une nuit ; cible utilisateur 8-12 h)")
+
+
+def main() -> None:
+    """Les trois analyses à la suite ; un fichier manquant n'arrête pas les autres."""
+    analyse_1()
+    analyse_2()
+    analyse_3()
+
+
+main()
