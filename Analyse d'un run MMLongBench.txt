@@ -1,0 +1,165 @@
+"""Analyse d'un run MMLongBench avec l'outillage de eval/analyze.py.
+
+Tout le volet outils de analyze.py est réutilisé tel quel : il ne lit que agent_metrics,
+identique d'un benchmark à l'autre. Seules load_scored, overview et quality_by sont
+réécrites ici — elles lisent judge_score, token_f1 et page_recall, qui n'existent pas
+dans un scored.jsonl MMLong.
+"""
+
+import ast
+import json
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+REPO = next(p for p in [Path.cwd(), *Path.cwd().parents] if (p / "config.py").exists())
+sys.path.insert(0, str(REPO / "eval"))
+sys.path.insert(0, str(REPO / "eval" / "mmlongbench"))
+
+import analyze                                          # noqa: E402
+from dataset import _strata                             # noqa: E402
+from official.eval_score import eval_acc_and_f1         # noqa: E402
+
+RUN_ID = "mm_strat30_01"
+RUNS_MM = REPO / "eval" / "mmlongbench" / "runs"
+NOT_ANSWERABLE = "Not answerable"
+
+
+def load_scored_mm(run_id: str) -> pd.DataFrame:
+    """Le scored.jsonl d'un run MMLong, à plat, avec les colonnes dérivées.
+
+    Adapté de analyze.py:188 (load_scored) pour MMLong : RUNS pointe ailleurs, la note
+    est `score` et non `judge_score`, et il n'y a ni token_f1 ni page_recall. Le gold est
+    déjà dans scored.jsonl — score_mm.py y recopie GOLD_FIELDS — donc rien à joindre.
+
+    Args:
+        run_id: L'itération à charger.
+
+    Returns:
+        Une ligne par question, colonnes agent_metrics aplaties + dérivées MMLong.
+    """
+    rows = [json.loads(l) for l
+            in (RUNS_MM / run_id / "scored.jsonl").read_text(encoding="utf-8").splitlines()
+            if l.strip()]
+    df = pd.json_normalize(rows)
+    df.columns = [c.replace("agent_metrics.", "").replace("tokens.", "tokens_")
+                  for c in df.columns]
+    for col, default in (("tool_sequence", []), ("invalid_tool_args", [])):
+        if col not in df.columns:
+            df[col] = [list(default) for _ in range(len(df))]
+
+    # Gold dérivé : mêmes strates que le tirage, donc les décompositions ci-dessous se
+    # lisent en face du récapitulatif de sample_dataset.
+    strata = df.apply(_strata, axis=1)
+    df["answerability"] = [s[0] for s in strata]
+    df["evidence_sources_l"] = [list(s[1]) or ["(aucune)"] for s in strata]
+    df["n_evidence_pages"] = df["evidence_pages"].map(lambda s: len(ast.literal_eval(s)))
+
+    # L'ordre de analyze.py met abstention AVANT wrong parce que le juge FinRAG note 0 les
+    # deux. Ici une abstention sur un gold non-répondable vaut 1.0 : elle ne peut donc pas
+    # écraser "correct", et sort en colonne booléenne à part.
+    outcome = pd.Series("wrong", index=df.index)
+    outcome[df["score"] == 1] = "correct"
+    outcome[df["score"].isna()] = "unparsed"
+    outcome[df["error"].notna()] = "error"
+    df["outcome"] = outcome
+    df["abstention_agent"] = df["pred_answer"].isna()        # l'agent n'a rien répondu
+    df["abstention_pred"] = df["pred"] == NOT_ANSWERABLE     # ce que le scoring officiel voit
+    df["gold_unanswerable"] = df["answer"] == NOT_ANSWERABLE
+    df["tokens_per_step"] = df["tokens_total"] / df["n_steps"]
+    df["n_invalid"] = df["invalid_tool_args"].str.len()
+
+    for tool in analyze.TOOL_SPECS:                          # réutilisé, pas réécrit
+        df[f"attempts_{tool}"] = analyze._attempts(df, tool)
+        df[f"used_{tool}"] = df[f"attempts_{tool}"] > 0
+    df["attempts"] = sum(df[f"attempts_{t}"] for t in analyze.TOOL_SPECS)
+    df["tool_set"] = analyze._tool_set_labels(df, pd.Series(True, index=df.index))
+    return df
+
+
+def notee(df: pd.DataFrame) -> list[dict]:
+    """Les lignes que le scoring officiel prend en compte, au format qu'il attend.
+
+    json_normalize crée une colonne `score` pour TOUTES les lignes, NaN comprises, alors
+    que eval_acc_and_f1 filtre sur la PRÉSENCE de la clé : sans ce filtre les non-parsées
+    entrent dans les sommes et l'accuracy comme le F1 sortent NaN.
+    """
+    return df[df["score"].notna()].to_dict("records")
+
+
+def quality_by_mm(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    """Accuracy, F1 officiel et abstention groupés par `column`.
+
+    Adapté de analyze.py:369 (quality_by) : accuracy sur `score`, F1 délégué au
+    eval_acc_and_f1 officiel plutôt que recalculé, et ni token_f1 ni page_recall.
+
+    Args:
+        df: Sortie de load_scored_mm.
+        column: Colonne de groupement.
+
+    Returns:
+        Une ligne par groupe, le plus gros d'abord.
+    """
+    g = df.groupby(column)
+    table = pd.DataFrame({
+        "n": g.size(),
+        "accuracy": g["score"].mean(),
+        "f1": g.apply(lambda d: eval_acc_and_f1(notee(d))[1], include_groups=False),
+        "abstention": g["abstention_pred"].mean(),
+        "cap_rate": g["hit_max_iterations"].mean(),
+        "forced_rate": g["submit_draft_source"].apply(lambda s: (s == "forced").mean()),
+        "tokens_mean": g["tokens_total"].mean(),
+    })
+    return table.sort_values("n", ascending=False).round(3)
+
+
+def show(run_id: str = RUN_ID) -> pd.DataFrame:
+    """Imprime toutes les tables du run et rend la frame pour le travail ad hoc."""
+    df = load_scored_mm(run_id)
+    n_all = sum(1 for l in (RUNS_MM / run_id / "all.jsonl").read_text(
+        encoding="utf-8").splitlines() if l.strip())
+    fails = RUNS_MM / run_id / "failures.jsonl"
+    n_fail = sum(1 for l in fails.read_text(encoding="utf-8").splitlines()
+                 if l.strip()) if fails.exists() else 0
+
+    acc, f1 = eval_acc_and_f1(notee(df))
+    print(f"=== {run_id} ===")
+    print(f"{len(df)} scorées / {n_all} dans all.jsonl / {n_fail} perdues (infra)")
+    print(f"Accuracy {acc:.4f} | F1 {f1:.4f} | "
+          f"non parsées {(df['outcome'] == 'unparsed').sum()}")
+
+    print("\n--- coût par question ---")
+    print(df[["n_steps", "tokens_total", "tokens_per_step", "duration_s", "attempts"]]
+          .describe().T[["mean", "50%", "min", "max"]].round(1).to_string())
+
+    for col, titre in (("answerability", "answerability"), ("answer_format", "format"),
+                       ("doc_type", "type de document")):
+        print(f"\n--- par {titre} ---")
+        print(quality_by_mm(df, col).to_string())
+
+    print("\n--- par evidence source (multi-label, une question compte dans chacune) ---")
+    print(quality_by_mm(df.explode("evidence_sources_l"), "evidence_sources_l").to_string())
+
+    print("\n--- abstention ---")
+    ct = pd.crosstab(df["abstention_pred"], df["gold_unanswerable"])
+    print(ct.rename_axis(index="abstention", columns="gold non-répondable").to_string())
+    juste = df[df["abstention_pred"] & df["gold_unanswerable"]]
+    fausse = df[df["abstention_pred"] & ~df["gold_unanswerable"]]
+    manquee = df[~df["abstention_pred"] & df["gold_unanswerable"]]
+    print(f"  abstentions justes   {len(juste):>4}  (score moyen {juste['score'].mean():.3f})")
+    print(f"  abstentions à tort   {len(fausse):>4}")
+    print(f"  abstentions manquées {len(manquee):>4}  (gold non-répondable, réponse donnée)")
+    print(f"  désaccord agent/extracteur : "
+          f"{(df['abstention_agent'] != df['abstention_pred']).sum()} lignes")
+
+    print("\n--- outils (analyze.tools_overview, réutilisé tel quel) ---")
+    print(analyze.tools_overview(df).to_string())
+    print("\n--- intensité par answerability (analyze.tools_per_sample) ---")
+    print(analyze.tools_per_sample(df, "answerability").to_string())
+    print("\n--- coût par outcome (analyze.cost_by) ---")
+    print(analyze.cost_by(df, "outcome").to_string())
+    return df
+
+
+df = show()
