@@ -1,0 +1,2066 @@
+"""DOM agent v2 — navigation and reading split across two tiers.
+
+run_dom_agent_v2 keeps the ORCHESTRATOR on the XML skeleton and delegates every read to an
+EPHEMERAL subagent: one invocation per delegation, its context dropped once it has
+reported. Only a compressed report reaches the orchestrator, so the tool results that made
+the single-phase loop silt up never accumulate at the navigation tier.
+
+The subagent has NO get_section. Its sections are PRE-LOADED into the message that opens
+the invocation. That is what keeps the cost linear — the single-phase loop re-sends a
+context that grows with every read, so reading k sections costs O(k^2) tokens — and what
+puts every crop in a context already holding the section text, the favourable oracle_img
+case of E1/E5, obtained by construction rather than asked for in a prompt.
+
+Nothing here modifies agent_dom: _add_usage and _serve_visual are imported from it, the
+read tools come from dom_tools/dom_visual unchanged, and _init_metrics_v2 re-emits the v1
+metric keys under their v1 names, in their v1 order, so score_results and eval/analyze.py
+run on a v2 run untouched. Every v2 metric is ADDITIVE, in flat keys beside them.
+"""
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any
+
+# Requires PyYAML (external runtime dependency, not declared in this repo).
+import yaml
+from openai import OpenAI
+
+from agent_dom import _add_usage, _check_pdf_matches_dom, _normalize_draft, _serve_visual
+from config import MISTRAL_AGENT_MODEL, MISTRAL_API_KEY, MISTRAL_BASE_URL
+from dom_render import truncate
+from dom_tools import (QA_SCHEMA, SUBMIT_DRAFT, _heading_text, build_search_index,
+                       build_submit_draft_tool, render_section)
+from dom_visual import GET_VISUAL, build_get_visual_tool
+from eval.metrics import normalize_text
+from eval.rate_limit import call_with_retry
+
+logger = logging.getLogger(__name__)
+
+client = OpenAI(
+    base_url=MISTRAL_BASE_URL,
+    api_key=MISTRAL_API_KEY,
+)
+
+# The two tiers are configured separately on purpose. They hold the same id in v2.0 so the
+# architecture is measured alone; SUBAGENT_MODEL is the single line to change when a VLM
+# is confirmed on the endpoint (v2.2), and no other code has to move.
+ORCHESTRATOR_MODEL = MISTRAL_AGENT_MODEL
+SUBAGENT_MODEL = MISTRAL_AGENT_MODEL
+
+with open(Path(__file__).parent / "prompts_dom_v2.yaml", encoding="utf-8") as f:
+    PROMPTS_V2 = yaml.safe_load(f)
+
+# (orchestrator system key, orchestrator user template key, finish-tool field schema). Only
+# "qa" exists in v2: the KYC arm has no v2 prompt bank, and an unknown mode must raise here
+# rather than run the wrong pair.
+_MODES_V2 = {
+    "qa": ("orchestrator_system", "orchestrator_user_template", QA_SCHEMA),
+}
+
+# Orchestrator tools. get_section and search are NOT among them: the orchestrator never
+# reads a section, and its search goes through search_and_read, which forwards to the
+# subagent within the same call.
+DELEGATE_READ = "delegate_read"
+SEARCH_AND_READ = "search_and_read"
+
+# Subagent tool. Its sections arrive pre-loaded, so get_visual and report are all it has.
+REPORT = "report"
+
+# Detection only, never parsing, one tuple per tier — same contract as
+# agent_dom._TOOL_NAMES: a tool missing from its tier's tuple, when emitted as prose, is
+# not counted as tool_call_in_content and falls through to no_tool_no_answer, which reads
+# as a protocol regression the model never made. agent_dom's own helper closes over ITS
+# tuple, so the detection is re-expressed here rather than imported.
+_ORCHESTRATOR_TOOL_NAMES = (DELEGATE_READ, SEARCH_AND_READ, SUBMIT_DRAFT)
+_SUBAGENT_TOOL_NAMES = (GET_VISUAL, REPORT)
+
+# Budgets. v2.0 holds top_k at the value the single-phase run used: raising k is v2.1, and
+# changing it here would confound it with the split this run is meant to measure.
+ORCHESTRATOR_MAX_ROUNDS = 3
+SEARCH_TOP_K = 5
+# Ceiling, not a target: the subagent reads nothing (its sections are already there), so
+# this only bounds get_visual plus the closing report.
+SUBAGENT_MAX_TOOL_CALLS = 6
+
+# Caps applied to a report BEFORE it enters the orchestrator's context, where several of
+# them stack across rounds. They bite on the free-text lists only: key_figures and
+# evidence quotes are the verbatim channel and are never touched (see _compact_report).
+REPORT_MAX_LIST_ITEMS = 6
+REPORT_ITEM_CHARS = 120
+
+# Off by default: when True the run writes the full report, the pre-loaded context and the
+# key_figures verdicts under runs/{run_id}/debug_v2/, OUTSIDE the scored rows.
+LOG_SUBAGENT_DETAILS = False
+
+_RETRY_PROTOCOL_MSG = (
+    "Your last message put a tool call in the message content instead of using the "
+    "tool-calling protocol. Content is discarded. Re-emit it as a real tool call."
+)
+
+
+# --------------------------------------------------------------------------- #
+# Metrics                                                                      #
+# --------------------------------------------------------------------------- #
+def _init_metrics_v2() -> dict[str, Any]:
+    """Pre-initialize every metric key; the v1 block keeps its exact v1 order.
+
+    The first twenty keys are agent_dom._init_metrics, name for name and position for
+    position. eval/analyze.py only strips the `agent_metrics.` and `tokens.` prefixes off
+    the flattened columns, so a v2 metric nested under a tier would come out as a column of
+    its own AND leave tokens_total empty — every cost table would break. The v2 keys are
+    therefore appended flat, after the v1 block, and nothing above them ever moves.
+
+    Two v1 keys are read differently in v2, deliberately, under unchanged names:
+      n_steps            — LLM calls of BOTH tiers, so analyze's tokens_per_step stays
+                           tokens over calls rather than tokens over rounds.
+      get_section_calls  — the sections PRE-LOADED for the subagent. In v2 the code reads
+                           them on the model's behalf, so used_section means "sections were
+                           delivered", not "the model chose to read". Recorded in the run's
+                           notes, which is the only place a run says what it changed.
+
+    Returns:
+        The metrics dict, every key present.
+    """
+    return {
+        # --- v1 block: same keys, same order, same meaning unless said otherwise ------
+        "n_steps": 0,
+        "n_get_section_calls": 0,
+        "n_unique_sections_fetched": 0,
+        "tokens": {"prompt": 0, "completion": 0, "total": 0},
+        "hit_max_iterations": False,
+        "submit_draft_source": "none",
+        "tool_calls_ok": 0,
+        "tool_call_in_content": 0,
+        "tool_call_malformed": 0,
+        "both_channels": 0,
+        "no_tool_no_answer": 0,
+        "duration_s": 0.0,
+        "get_section_calls": [],
+        "invalid_tool_args": [],
+        "n_search_calls": 0,
+        "search_calls": [],
+        "n_get_visual_calls": 0,
+        "get_visual_calls": [],
+        "n_unique_visuals_fetched": 0,
+        "tool_sequence": [],
+        # --- v2 block: additive, flat, never at the cost of a key above ---------------
+        # Entries of tool_sequence and invalid_tool_args carry an extra "tier" field for
+        # the same reason: added INSIDE the entry, so both lists stay readable exactly as
+        # they are today by anything that ignores the new field.
+        "orchestrator_rounds": 0,
+        "orchestrator_tool_sequence": [],
+        "subagent_invocations": 0,
+        # One entry per invocation: {tool_sequence, n_get_visual, hit_cap, tokens,
+        # section_ids, context_tokens}. A list of dicts survives json_normalize untouched,
+        # the way invalid_tool_args already does.
+        "subagent_stats": [],
+        "subagent_context_tokens": [],
+        # Verbatim check of the report's key_figures against the markdown they came from:
+        # {figure, section_id, match} with match in exact|normalized|absent. Recorded,
+        # NEVER repaired — same discipline as invalid_tool_args.
+        "key_figures_check": [],
+        # Reported page against the [page_start, page_end] of the sections delivered.
+        "page_range_check": [],
+        # page_recall is pure recall (one cited page inside gold scores 1.0, no precision
+        # penalty), so a tier that cites more pages scores better for free. Logged to tell
+        # a real gain from that artefact when v2 is put next to v1.
+        "n_cited_pages": 0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Section id resolution                                                        #
+# --------------------------------------------------------------------------- #
+def build_section_maps(dom: dict) -> dict[str, Any]:
+    """Section objects, ancestor chains and breadcrumbs, in one pre-order walk.
+
+    Built once per document. The section tree carries no parent pointer, so the chain is
+    accumulated on the way down instead of being searched for on demand: a delegation then
+    resolves in O(k x depth) rather than one full tree scan per candidate.
+
+    The root is `tree` itself — section_id "root", children under "sections" and not
+    "subsections" — and is left out of every chain: it names the document, not a position
+    inside it.
+
+    Args:
+        dom: build_dom output ({header, index, chrome, tree}).
+
+    Returns:
+        {"section", "ancestors", "crumb"}, each keyed by section_id: the section object,
+        its ancestor ids outermost-first, and its titles joined into a breadcrumb.
+    """
+    sections: dict[str, dict] = {}
+    ancestors: dict[str, tuple[str, ...]] = {}
+    crumb: dict[str, str] = {}
+
+    # Explicit stack, reversed so siblings come out in document order. A section is always
+    # popped after its ancestors, so their labels are in `sections` when the crumb is built.
+    stack = [(section, ()) for section in reversed(dom["tree"]["sections"])]
+    while stack:
+        section, chain = stack.pop()
+        section_id = section["section_id"]
+        sections[section_id] = section
+        ancestors[section_id] = chain
+        crumb[section_id] = " > ".join(
+            [_heading_text(sections[ancestor]) for ancestor in chain]
+            + [_heading_text(section)])
+        for sub in reversed(section["subsections"]):
+            stack.append((sub, chain + (section_id,)))
+
+    return {"section": sections, "ancestors": ancestors, "crumb": crumb}
+
+
+def resolve_section_ids(section_ids: Any, maps: dict[str, Any], metrics: dict[str, Any],
+                        step: int, tool: str) -> list[str]:
+    """Deliverable section ids: known, deduplicated by ancestor, in the order given.
+
+    Three passes, in this order:
+      1. unknown ids are dropped and recorded in invalid_tool_args — a hallucinated id is a
+         measurement, not a crash, and render_section would only turn it into an error dict
+         nobody reads;
+      2. duplicates collapse onto their first occurrence;
+      3. a candidate having an ancestor in the same set is dropped: render_section renders
+         a section AND its whole subtree, so keeping the ancestor loses nothing the
+         descendant carried. Disjoint siblings both survive.
+
+    The order handed in is preserved throughout — it is the BM25 rank on the search path,
+    and it decides what the subagent reads first. It is never re-sorted.
+
+    Note that step 3 reduces the NUMBER of sections while it can raise their token weight:
+    an ancestor two levels up expands to everything under it. That is why
+    subagent_context_tokens is logged rather than capped.
+
+    Args:
+        section_ids: The ids as the model or the search sent them; any type.
+        maps: build_section_maps output.
+        metrics: Shared metrics dict, mutated in place.
+        step: Current orchestrator round, for the refusal record.
+        tool: Tool the ids came from, for the refusal record.
+
+    Returns:
+        The ids to pre-load, in delivery order; possibly empty.
+    """
+    candidates = section_ids if isinstance(section_ids, list) else []
+
+    known: list[str] = []
+    for section_id in candidates:
+        if isinstance(section_id, str) and section_id in maps["section"]:
+            if section_id not in known:
+                known.append(section_id)
+        else:
+            metrics["invalid_tool_args"].append(
+                {"tool": tool, "args": {"section_id": section_id},
+                 "reason": "unknown_section_id", "step": step, "tier": "orchestrator"})
+
+    kept = set(known)
+    return [section_id for section_id in known
+            if not set(maps["ancestors"][section_id]) & kept]
+
+
+def build_subagent_context(section_ids: list[str], dom: dict,
+                           maps: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """The pre-loaded sections, each under the breadcrumb of its position.
+
+    The subagent never sees the skeleton, so the breadcrumb is what restores the one
+    navigational fact the markdown alone cannot carry: where in the document this text
+    sits. The sections are wrapped in id-carrying tags so a report can name the section a
+    quote came from instead of having to infer it.
+
+    Nothing is truncated and nothing is capped: the sections go in whole. An oversized
+    context has to become visible in subagent_context_tokens, on a real document, rather
+    than be hidden by a cut — and a cut would sever a closing page band and leave a quote
+    with no `### Start Page N ###` above it, which is the one thing the page transport
+    cannot survive.
+
+    Args:
+        section_ids: Ids to deliver, already resolved, in delivery order.
+        dom: build_dom output.
+        maps: build_section_maps output.
+
+    Returns:
+        `(context_markdown, loaded)` — the blob handed to the subagent, and one record per
+        section {"section_id", "crumb", "markdown"} kept for the key_figures check and the
+        debug dump.
+    """
+    blocks: list[str] = []
+    loaded: list[dict[str, Any]] = []
+
+    for section_id in section_ids:
+        markdown = render_section(section_id, dom)
+        if not isinstance(markdown, str):
+            # resolve_section_ids already filtered unknown ids, so this is unreachable
+            # unless the dom and the maps came from two different builds.
+            logger.warning("%s resolved but did not render; dom and maps disagree",
+                           section_id)
+            continue
+        crumb = maps["crumb"][section_id]
+        blocks.append(f'<section id="{section_id}" path="{crumb}">\n{markdown}\n</section>')
+        loaded.append({"section_id": section_id, "crumb": crumb, "markdown": markdown})
+
+    return "\n\n".join(blocks), loaded
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count of a context, on dom_render's four-chars-per-token convention."""
+    return len(text) // 4
+
+
+# --------------------------------------------------------------------------- #
+# The report — the subagent's finish-tool                                      #
+# --------------------------------------------------------------------------- #
+def build_report_tool() -> dict[str, Any]:
+    """The subagent's finish-tool definition.
+
+    section_contents is required while candidate_answer is not: the report describes what
+    was read even when nothing answered, because that description is the navigational
+    signal the orchestrator acts on. A bare "not found" would give it nothing.
+
+    Returns:
+        The tool definition, OpenAI function-calling shape.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": REPORT,
+            "description": (
+                "End your work and send everything back. Call it exactly once. "
+                "section_contents carries one entry per section you were given, whether or "
+                "not it answered."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_answer": {
+                        "type": ["string", "null"],
+                        "description": ("Your answer to the sub-question, or null when what "
+                                        "you were given does not answer it."),
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                        "description": "How sure you are of candidate_answer.",
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "description": ("The passages you answered from; empty when "
+                                        "candidate_answer is null."),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "section_id": {
+                                    "type": "string",
+                                    "description": "id of the <section> the quote came from.",
+                                },
+                                "atom_id": {
+                                    "type": ["string", "null"],
+                                    "description": ("pN_eM of the table or figure it came "
+                                                    "from, or null for running text."),
+                                },
+                                "quote": {
+                                    "type": "string",
+                                    "description": ("Exact substring of the section, copied "
+                                                    "character for character."),
+                                },
+                                "pages": {
+                                    "type": "array",
+                                    "items": {"type": "integer"},
+                                    "description": ("Pages the quote sits on, copied from "
+                                                    "the nearest ### Start Page N ### "
+                                                    "marker above it. 0-indexed."),
+                                },
+                            },
+                            "required": ["section_id", "quote", "pages"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "section_contents": {
+                        "type": "array",
+                        "description": "One entry per section you were given. Never empty.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "section_id": {"type": "string"},
+                                "topics": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "What the section covers, in your words.",
+                                },
+                                "key_figures": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": ("Figures copied VERBATIM with their "
+                                                    "units, never rounded or paraphrased."),
+                                },
+                                "visuals_present": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": ("Tables and figures seen, each named by "
+                                                    "its atom id plus a short caption."),
+                                },
+                            },
+                            "required": ["section_id", "topics", "key_figures"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "recommendation": {
+                        "type": "string",
+                        "enum": ["answer_ready", "search_elsewhere", "try_sections"],
+                        "description": "What the navigator should do next.",
+                    },
+                    "try_section_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": ("Section ids something you read points at; only "
+                                        "with recommendation try_sections."),
+                    },
+                },
+                "required": ["confidence", "section_contents", "recommendation"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _normalize_report(payload: Any) -> dict[str, Any]:
+    """Coerce raw report arguments into the canonical report shape.
+
+    The tool schema is advisory on this endpoint, so every field is rebuilt rather than
+    trusted: a missing one becomes its neutral value and a list that came back as something
+    else becomes empty. Values themselves are kept exactly as the model sent them — no
+    coercion, so a malformed page stays visible to the checks instead of being silently
+    dropped here.
+
+    Args:
+        payload: The raw arguments object of the report tool call.
+
+    Returns:
+        The report, every key present.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+
+    def _dicts(key: str) -> list[dict[str, Any]]:
+        value = payload.get(key)
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    try_ids = payload.get("try_section_ids")
+    return {
+        "candidate_answer": payload.get("candidate_answer"),
+        "confidence": payload.get("confidence"),
+        "evidence": _dicts("evidence"),
+        "section_contents": _dicts("section_contents"),
+        "recommendation": payload.get("recommendation"),
+        "try_section_ids": [i for i in try_ids if isinstance(i, str)] if isinstance(try_ids, list) else [],
+    }
+
+
+def _descriptive_fallback(section_ids: list[str]) -> dict[str, Any]:
+    """The report of an invocation that produced none, naming the sections it was given.
+
+    Used when the model never called report and the forced call did not comply either. It
+    carries no description — there is nothing to describe without a model — but it still
+    tells the orchestrator which sections are now covered, which is the one thing that
+    keeps it from delegating them again.
+
+    Args:
+        section_ids: The sections that were delivered.
+
+    Returns:
+        A report in canonical shape.
+    """
+    return {
+        "candidate_answer": None,
+        "confidence": "low",
+        "evidence": [],
+        "section_contents": [{"section_id": section_id, "topics": [], "key_figures": [],
+                              "visuals_present": []} for section_id in section_ids],
+        "recommendation": "search_elsewhere",
+        "try_section_ids": [],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Protocol classification                                                      #
+# --------------------------------------------------------------------------- #
+def _looks_like_tool_call_in_content(content: str | None,
+                                     tool_names: tuple[str, ...]) -> bool:
+    """True when `content` names one of this tier's tools and opens a brace after it."""
+    if not content:
+        return False
+    return any(name in content and content.find("{", content.find(name)) != -1
+               for name in tool_names)
+
+
+def _classify_protocol(message: Any, tool_names: tuple[str, ...],
+                       metrics: dict[str, Any]) -> str:
+    """Bucket one assistant turn, exactly as the single-phase loop does.
+
+    The four buckets are exclusive and counted before anything is dispatched, so the
+    protocol numbers of a v2 run stay comparable with a v1 run: both tiers feed the same
+    root counters.
+
+    Args:
+        message: The assistant message of the response.
+        tool_names: This tier's tool names, for the prose detection.
+        metrics: Shared metrics dict, mutated in place.
+
+    Returns:
+        "dispatch" to serve the tool calls, "retry" to re-ask for the protocol, "stop" when
+        the model produced neither a call nor an answer.
+    """
+    has_tool_calls = bool(message.tool_calls)
+    in_content = _looks_like_tool_call_in_content(message.content, tool_names)
+
+    if has_tool_calls and in_content:
+        metrics["both_channels"] += 1
+        return "dispatch"
+    if has_tool_calls:
+        metrics["tool_calls_ok"] += 1
+        return "dispatch"
+    if in_content:
+        metrics["tool_call_in_content"] += 1
+        return "retry"
+    metrics["no_tool_no_answer"] += 1
+    return "stop"
+
+
+# --------------------------------------------------------------------------- #
+# Non-repairing checks on the report                                           #
+# --------------------------------------------------------------------------- #
+def check_key_figures(report: dict[str, Any], loaded: list[dict[str, Any]],
+                      metrics: dict[str, Any], round_index: int) -> None:
+    """Test every key_figure against the markdown it was read from; record, never repair.
+
+    key_figures verbatim is the linchpin of a numeric cross-page answer — "EUR 4.2bn" can
+    be combined with a figure from another report, "about four billion" cannot — and it is
+    a prompt constraint with nothing enforcing it. So it is measured: an exact substring
+    first, then the same test through metrics.normalize_text, which absorbs currency marks,
+    thousands separators and case without touching the digits.
+
+    A "normalized" verdict is not a failure; it is a figure the model re-spelled. Only
+    "absent" says the figure is not in what it read.
+
+    Args:
+        report: The canonical report.
+        loaded: build_subagent_context's per-section records.
+        metrics: Shared metrics dict, mutated in place.
+        round_index: Orchestrator round the invocation belongs to.
+    """
+    markdown = {record["section_id"]: record["markdown"] for record in loaded}
+    normalized: dict[str, str] = {}
+
+    for entry in report["section_contents"]:
+        section_id = entry.get("section_id")
+        source = markdown.get(section_id)
+        figures = entry.get("key_figures")
+        for figure in figures if isinstance(figures, list) else []:
+            if not isinstance(figure, str) or not figure.strip():
+                verdict = "absent"
+            elif source is None:
+                verdict = "unknown_section"
+            elif figure in source:
+                verdict = "exact"
+            else:
+                if section_id not in normalized:
+                    normalized[section_id] = normalize_text(source)
+                needle = normalize_text(figure)
+                verdict = "normalized" if needle and needle in normalized[section_id] else "absent"
+            metrics["key_figures_check"].append(
+                {"round": round_index, "section_id": section_id, "figure": figure,
+                 "match": verdict})
+
+
+def check_page_ranges(report: dict[str, Any], section_ids: list[str], maps: dict[str, Any],
+                      metrics: dict[str, Any], round_index: int) -> None:
+    """Test every cited page against the territory of the section it is claimed from.
+
+    The subagent is the only tier that sees the `### Start Page N ###` markers, so its
+    pages are the only ones that can reach the final answer. Deriving them here instead —
+    from the section's own page_start/page_end, which this code knows — would be the easy
+    path and the wrong one: page_recall is pure recall, so a derived range would score
+    close to 1.0 mechanically and destroy comparability with the single-phase run.
+
+    page_start/page_end already cover a section's FULL territory, subsections included, so
+    the range is the right test for a delivered ancestor too. Recorded, never repaired.
+
+    Args:
+        report: The canonical report.
+        section_ids: The sections that were delivered.
+        maps: build_section_maps output.
+        metrics: Shared metrics dict, mutated in place.
+        round_index: Orchestrator round the invocation belongs to.
+    """
+    delivered = set(section_ids)
+
+    for entry in report["evidence"]:
+        section_id = entry.get("section_id")
+        pages = entry.get("pages")
+        for page in pages if isinstance(pages, list) else []:
+            if section_id not in delivered:
+                verdict = "unknown_section"
+            elif not isinstance(page, int) or isinstance(page, bool):
+                verdict = "not_an_int"
+            else:
+                section = maps["section"][section_id]
+                start, end = section["page_start"], section["page_end"]
+                verdict = ("no_page_range" if start is None else
+                           "in_range" if start <= page <= end else "out_of_range")
+            metrics["page_range_check"].append(
+                {"round": round_index, "section_id": section_id, "page": page,
+                 "verdict": verdict})
+
+
+# --------------------------------------------------------------------------- #
+# Subagent                                                                     #
+# --------------------------------------------------------------------------- #
+def _force_report(messages: list[dict[str, Any]], report_tool: dict[str, Any],
+                  model: str, metrics: dict[str, Any],
+                  invocation: dict[str, Any]) -> dict[str, Any] | None:
+    """Last forced call on the report tool, or None if the model still does not comply.
+
+    Goes through call_with_retry like every other call: a 429 here must raise and let the
+    runner drop the question as a replayable loss, never be swallowed into a row that the
+    resume filter would then freeze as done.
+
+    Args:
+        messages: Conversation so far (must not end on an unanswered tool call).
+        report_tool: The report tool definition.
+        model: Chat model id.
+        metrics: Shared metrics dict, mutated in place.
+        invocation: This invocation's stats entry, mutated in place.
+
+    Returns:
+        The normalized report, or None.
+    """
+    # Endpoint robustness: only the finish-tool is exposed (1-tool list) on top of the
+    # named forcing. If the shim rejects the named form, replace tool_choice by "required".
+    metrics["n_steps"] += 1
+    response = call_with_retry(
+        client.chat.completions.create,
+        model=model,
+        messages=messages,
+        tools=[report_tool],
+        tool_choice={"type": "function", "function": {"name": REPORT}},
+    )
+    _add_usage(response, metrics)
+    _add_usage(response, invocation)
+
+    for tool_call in (response.choices[0].message.tool_calls or []):
+        if tool_call.function.name != REPORT:
+            continue
+        try:
+            args = json.loads(tool_call.function.arguments or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return _normalize_report(args)
+    return None
+
+
+def run_subagent(focused_query: str, section_ids: list[str], dom: dict,
+                 maps: dict[str, Any], pdf_path: str | Path | None,
+                 metrics: dict[str, Any], round_index: int, visuals_seen: set[str],
+                 sections_seen: set[str], model: str = SUBAGENT_MODEL,
+                 prompts: dict[str, str] | None = None,
+                 max_tool_calls: int = SUBAGENT_MAX_TOOL_CALLS
+                 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One ephemeral read: pre-load the sections, look at what is needed, report back.
+
+    The invocation owns nothing that outlives it. Its context is dropped on return and only
+    the report goes up, which is the whole point of the split: the tool results that made
+    the single-phase loop silt up never reach the navigation tier.
+
+    Two pieces of state are deliberately scoped differently. `sent` is per invocation,
+    because "the image was already provided, look at it above" is only true inside the
+    context that received it — a later invocation never saw it. `visuals_seen` is
+    run-level, because n_unique_visuals_fetched must mean in v2 what it meant in v1.
+
+    Args:
+        focused_query: The self-contained sub-question written by the orchestrator.
+        section_ids: Sections to deliver, already resolved, in delivery order.
+        dom: build_dom output.
+        maps: build_section_maps output.
+        pdf_path: Source PDF, or None to keep the invocation text-only.
+        metrics: Shared metrics dict, mutated in place.
+        round_index: Orchestrator round this invocation belongs to.
+        visuals_seen: Run-level set of atom ids whose crop was served; mutated.
+        sections_seen: Run-level set of sections actually delivered; mutated.
+        model: Chat model id of this tier.
+        prompts: Prompt bank; defaults to the module's.
+        max_tool_calls: Ceiling on this invocation's turns.
+
+    Returns:
+        `(report, debug)` — the canonical report, and the artefacts a debug run dumps
+        ({"round", "section_ids", "context", "crumbs", "report"}).
+    """
+    prompts = PROMPTS_V2 if prompts is None else prompts
+    context, loaded = build_subagent_context(section_ids, dom, maps)
+    context_tokens = estimate_tokens(context)
+    delivered = [record["section_id"] for record in loaded]
+
+    # The delivered sections are recorded under the v1 trace names: in v2 the code reads on
+    # the model's behalf, so this is what "which sections did this run read" means. Stated
+    # in _init_metrics_v2 and in the run's notes, because the name did not change.
+    metrics["n_get_section_calls"] += len(section_ids)
+    metrics["get_section_calls"].extend(section_ids)
+    metrics["subagent_invocations"] += 1
+    metrics["subagent_context_tokens"].append(context_tokens)
+    sections_seen.update(delivered)
+
+    invocation: dict[str, Any] = {
+        "round": round_index,
+        "section_ids": list(delivered),
+        "context_tokens": context_tokens,
+        "tokens": {"prompt": 0, "completion": 0, "total": 0},
+        "tool_sequence": [],
+        "n_get_visual": 0,
+        "hit_cap": False,
+        "report_source": "none",
+    }
+    metrics["subagent_stats"].append(invocation)
+    debug = {"round": round_index, "section_ids": list(section_ids), "context": context,
+             "crumbs": {record["section_id"]: record["crumb"] for record in loaded},
+             "report": None}
+
+    # Nothing was delivered: the orchestrator named only unknown ids, or the search found
+    # nothing. Answered without an LLM call — there is no document text to read.
+    if not loaded:
+        report = _descriptive_fallback(section_ids)
+        debug["report"] = report
+        return report, debug
+
+    report_tool = build_report_tool()
+    tools = [build_get_visual_tool()] if pdf_path is not None else []
+    tools.append(report_tool)   # kept last, as the model reads the list in order
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": prompts["subagent_system"]},
+        {"role": "user", "content": prompts["subagent_user_template"].format(
+            focused_query=focused_query, context=context)},
+    ]
+
+    sent: dict[str, int] = {}
+    report = None
+
+    for step in range(max_tool_calls):
+        metrics["n_steps"] += 1
+        response = call_with_retry(client.chat.completions.create, model=model,
+                                   messages=messages, tools=tools)
+        _add_usage(response, metrics)
+        _add_usage(response, invocation)
+        message = response.choices[0].message
+
+        action = _classify_protocol(message, _SUBAGENT_TOOL_NAMES, metrics)
+        if action == "retry":
+            messages.append({"role": "assistant", "content": message.content})
+            messages.append({"role": "user", "content": _RETRY_PROTOCOL_MSG})
+            continue
+        if action == "stop":
+            break
+
+        messages.append(message.model_dump(exclude_none=True))
+        image_parts: list[dict[str, Any]] = []
+
+        # Every tool call gets a tool result, even once the report is in: leaving one
+        # unanswered makes the next request 400 and corrupts the replayable trace.
+        for tool_call in message.tool_calls:
+            name = tool_call.function.name
+            seq_entry: dict[str, Any] = {"step": step, "tool": name, "tier": "subagent",
+                                         "round": round_index}
+            metrics["tool_sequence"].append(seq_entry)
+            invocation["tool_sequence"].append(name)
+
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+                if not isinstance(args, dict):
+                    raise json.JSONDecodeError("not an object", "", 0)
+            except (json.JSONDecodeError, TypeError):
+                metrics["tool_call_malformed"] += 1
+                metrics["invalid_tool_args"].append(
+                    {"tool": name, "args": {"raw": tool_call.function.arguments},
+                     "reason": "malformed_json", "step": step, "tier": "subagent",
+                     "round": round_index})
+                seq_entry["args"] = {"raw": tool_call.function.arguments}
+                logger.warning("tool_call_malformed at subagent step %d (%s): %s", step,
+                               name, tool_call.function.arguments)
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": "arguments were not valid JSON; retry the call"})
+                continue
+
+            seq_entry["args"] = args
+
+            if name == GET_VISUAL:
+                # _serve_visual is agent_dom's, imported unchanged, so its refusal entries
+                # carry no tier: they are stamped here, on whatever it just appended.
+                before_refusals = len(metrics["invalid_tool_args"])
+                before_served = metrics["n_get_visual_calls"]
+                content = _serve_visual(args.get("atom_id"), dom, pdf_path, sent, step,
+                                        metrics, image_parts)
+                for entry in metrics["invalid_tool_args"][before_refusals:]:
+                    entry["tier"] = "subagent"
+                    entry["round"] = round_index
+                served = metrics["n_get_visual_calls"] - before_served
+                if served:
+                    invocation["n_get_visual"] += served
+                    visuals_seen.add(args.get("atom_id"))
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": content})
+
+            elif name == REPORT:
+                report = _normalize_report(args)
+                invocation["report_source"] = "tool"
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": "report received"})
+
+            else:
+                metrics["tool_call_malformed"] += 1
+                metrics["invalid_tool_args"].append(
+                    {"tool": name, "args": args, "reason": "unknown_tool", "step": step,
+                     "tier": "subagent", "round": round_index})
+                logger.warning("unknown tool %r at subagent step %d", name, step)
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": f"unknown tool {name!r}"})
+
+        # After the tool results, never before: the assistant turn's tool calls must all be
+        # answered before another role opens, or the next request 400s.
+        if image_parts:
+            messages.append({"role": "user", "content": image_parts})
+
+        if report is not None:
+            break
+    else:
+        # Loop exhausted without breaking: the ceiling was genuinely hit. An early break on
+        # no_tool_no_answer also lands in the forced call below, but is NOT a ceiling hit.
+        invocation["hit_cap"] = True
+
+    if report is None:
+        report = _force_report(messages, report_tool, model, metrics, invocation)
+        invocation["report_source"] = "forced" if report is not None else "none"
+    if report is None:
+        logger.error("subagent produced no report at round %d, even forced", round_index)
+        report = _descriptive_fallback(section_ids)
+
+    check_key_figures(report, loaded, metrics, round_index)
+    check_page_ranges(report, delivered, maps, metrics, round_index)
+
+    debug["report"] = report
+    return report, debug
+
+
+# --------------------------------------------------------------------------- #
+# Orchestrator tools                                                           #
+# --------------------------------------------------------------------------- #
+def build_delegate_read_tool() -> dict[str, Any]:
+    """Explicit delegation: the orchestrator picks the sections itself from the skeleton."""
+    return {
+        "type": "function",
+        "function": {
+            "name": DELEGATE_READ,
+            "description": (
+                "Send one or more sections to the reader with the sub-question you want "
+                "answered from them. Asking for a section delivers it AND all of its "
+                "subsections. Use it when the skeleton already tells you where to look."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "section_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": ("Section ids from the skeleton. An id of the form "
+                                        "pN_eM is an atom id and cannot be sent."),
+                    },
+                    "focused_query": {
+                        "type": "string",
+                        "description": ("Self-contained sub-question. The reader sees "
+                                        "neither the skeleton nor the original question."),
+                    },
+                },
+                "required": ["section_ids", "focused_query"],
+            },
+        },
+    }
+
+
+def build_search_and_read_tool(default_top_k: int) -> dict[str, Any]:
+    """Auto-forward: BM25 runs code-side and its hits go straight to the reader.
+
+    Args:
+        default_top_k: The run's configured k, advertised as the default and used as a
+            ceiling — see run_dom_agent_v2.
+
+    Returns:
+        The tool definition, OpenAI function-calling shape.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": SEARCH_AND_READ,
+            "description": (
+                "Locate a term lexically and send the matching sections STRAIGHT to the "
+                "reader with your sub-question — one call, no stop in between. Use it when "
+                "no section title obviously names what the question asks about. The "
+                "sections that were sent come back in the result, so you can see what the "
+                "keyword actually reached and retry with better words."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": ("2 to 5 content words, not a question. Matching is "
+                                        "lexical: a synonym will not match."),
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": (f"How many sections to send. Defaults to "
+                                        f"{default_top_k}, which is also the maximum."),
+                    },
+                    "focused_query": {
+                        "type": "string",
+                        "description": ("Self-contained sub-question. The reader sees "
+                                        "neither the skeleton nor the original question."),
+                    },
+                },
+                "required": ["keyword", "focused_query"],
+            },
+        },
+    }
+
+
+def _compact_report(report: dict[str, Any]) -> dict[str, Any]:
+    """The report as the orchestrator sees it: descriptions capped, verbatim fields intact.
+
+    Several reports stack up in the orchestrator's context across rounds, which is exactly
+    the accumulation the split exists to avoid — so the free-text parts are capped here,
+    code-side, rather than asked for short in the prompt where nothing enforces it.
+
+    What is NEVER capped: `key_figures` and `evidence[].quote`. Those two are the verbatim
+    channel — key_figures is what a numeric cross-page answer is assembled from, and the
+    quote is copied character for character into the final answer. Truncating either would
+    silently break the contract the subagent was held to.
+
+    Args:
+        report: The canonical report.
+
+    Returns:
+        A copy with topics and visuals_present capped; the full report stays in the debug
+        dump.
+    """
+    def _cap(value: Any) -> list[str]:
+        items = [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+        return [truncate(item, REPORT_ITEM_CHARS, REPORT_ITEM_CHARS + 20)
+                for item in items[:REPORT_MAX_LIST_ITEMS]]
+
+    return {
+        "candidate_answer": report["candidate_answer"],
+        "confidence": report["confidence"],
+        "evidence": report["evidence"],
+        "section_contents": [
+            {"section_id": entry.get("section_id"),
+             "topics": _cap(entry.get("topics")),
+             "key_figures": entry.get("key_figures"),
+             "visuals_present": _cap(entry.get("visuals_present"))}
+            for entry in report["section_contents"]],
+        "recommendation": report["recommendation"],
+        "try_section_ids": report["try_section_ids"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Orchestrator                                                                 #
+# --------------------------------------------------------------------------- #
+def _force_submit_draft_v2(messages: list[dict[str, Any]], submit_tool: dict[str, Any],
+                           field_definitions: dict[str, str], schema: dict[str, Any],
+                           model: str, metrics: dict[str, Any]) -> dict[str, Any] | None:
+    """Last forced call on the finish-tool, or None if the model still does not comply.
+
+    agent_dom's own version is not reused: it counts nothing into n_steps, because in v1 the
+    step budget belonged to the free loop alone. Here every LLM call of both tiers is
+    counted, so the forced call has to be too.
+
+    Args:
+        messages: Conversation so far (must not end on an unanswered tool call).
+        submit_tool: The finish-tool definition.
+        field_definitions: Mapping from field name to its definition text.
+        schema: The per-field property schema advertised to the model.
+        model: Chat model id.
+        metrics: Shared metrics dict, mutated in place.
+
+    Returns:
+        The normalized draft, or None.
+    """
+    metrics["n_steps"] += 1
+    response = call_with_retry(
+        client.chat.completions.create,
+        model=model,
+        messages=messages,
+        tools=[submit_tool],
+        tool_choice={"type": "function", "function": {"name": SUBMIT_DRAFT}},
+    )
+    _add_usage(response, metrics)
+
+    for tool_call in (response.choices[0].message.tool_calls or []):
+        if tool_call.function.name != SUBMIT_DRAFT:
+            continue
+        try:
+            args = json.loads(tool_call.function.arguments or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return _normalize_draft(args.get("fields"), field_definitions, schema)
+    return None
+
+
+def run_dom_agent_v2(dom: dict, xml_skeleton: str, field_definitions: dict[str, str],
+                     max_rounds: int = ORCHESTRATOR_MAX_ROUNDS,
+                     model: str = ORCHESTRATOR_MODEL,
+                     subagent_model: str = SUBAGENT_MODEL,
+                     mode: str = "qa", question: str = "",
+                     pdf_path: str | Path | None = None,
+                     prompts: dict[str, str] | None = None,
+                     search_top_k: int = SEARCH_TOP_K,
+                     subagent_max_tool_calls: int = SUBAGENT_MAX_TOOL_CALLS,
+                     log_subagent_details: bool = LOG_SUBAGENT_DETAILS
+                     ) -> tuple[dict, dict, list[dict[str, Any]]]:
+    """Answer one question with the orchestrator / ephemeral-subagent split.
+
+    The orchestrator sees the skeleton, the question and the reports it has received. It
+    never sees section text and never sees a crop: every read happens inside a subagent
+    invocation whose context is dropped on return.
+
+    Signature deliberately mirrors agent_dom.run_dom_agent so a runner's run_one is a
+    near-drop-in; the third return value is the only difference, and it is empty unless
+    log_subagent_details is on.
+
+    Args:
+        dom: build_dom output.
+        xml_skeleton: dom_render.build_outline_xml output.
+        field_definitions: Mapping from field name to its definition text.
+        max_rounds: Delegation budget of the orchestrator.
+        model: Chat model id of the orchestrator.
+        subagent_model: Chat model id of the reader; the same in v2.0, by design.
+        mode: Prompt/schema pair; only "qa" exists in v2.
+        question: The user's question.
+        pdf_path: Source PDF, or None to keep the run text-only.
+        prompts: Prompt bank; defaults to the module's.
+        search_top_k: Sections a search_and_read delivers, and the ceiling on what the
+            model may ask for.
+        subagent_max_tool_calls: Ceiling on one invocation's turns.
+        log_subagent_details: Collect the heavy per-invocation artefacts for a debug dump.
+
+    Returns:
+        `(draft, metrics, debug)`. draft maps each field to one entry per schema key, the
+        shape run_one reads; debug is one record per invocation, or [] when the flag is off.
+    """
+    started = time.perf_counter()
+    metrics = _init_metrics_v2()
+    system_key, user_key, schema = _MODES_V2[mode]
+    prompts = PROMPTS_V2 if prompts is None else prompts
+
+    if pdf_path is not None:
+        _check_pdf_matches_dom(dom, pdf_path)
+
+    maps = build_section_maps(dom)
+    search_index = build_search_index(dom)
+    submit_tool = build_submit_draft_tool(field_definitions, schema)
+    tools = [build_delegate_read_tool(), build_search_and_read_tool(search_top_k),
+             submit_tool]   # submit kept last, as the model reads the list in order
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": prompts[system_key]},
+        {"role": "user", "content": prompts[user_key].format(
+            skeleton=xml_skeleton,
+            field_definitions=json.dumps(field_definitions, indent=2, ensure_ascii=False),
+            question=question)},
+    ]
+
+    visuals_seen: set[str] = set()
+    sections_seen: set[str] = set()
+    debug: list[dict[str, Any]] = []
+    draft = None
+
+    for round_index in range(max_rounds):
+        metrics["orchestrator_rounds"] = round_index + 1
+        metrics["n_steps"] += 1
+        response = call_with_retry(client.chat.completions.create, model=model,
+                                   messages=messages, tools=tools)
+        _add_usage(response, metrics)
+        message = response.choices[0].message
+
+        action = _classify_protocol(message, _ORCHESTRATOR_TOOL_NAMES, metrics)
+        if action == "retry":
+            messages.append({"role": "assistant", "content": message.content})
+            messages.append({"role": "user", "content": _RETRY_PROTOCOL_MSG})
+            continue
+        if action == "stop":
+            break
+
+        messages.append(message.model_dump(exclude_none=True))
+
+        # Every tool call gets a tool result, even once the draft is in: leaving one
+        # unanswered makes the next request 400 and corrupts the replayable trace.
+        for tool_call in message.tool_calls:
+            name = tool_call.function.name
+            seq_entry: dict[str, Any] = {"step": round_index, "tool": name,
+                                         "tier": "orchestrator", "round": round_index}
+            metrics["tool_sequence"].append(seq_entry)
+            metrics["orchestrator_tool_sequence"].append(name)
+
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+                if not isinstance(args, dict):
+                    raise json.JSONDecodeError("not an object", "", 0)
+            except (json.JSONDecodeError, TypeError):
+                metrics["tool_call_malformed"] += 1
+                metrics["invalid_tool_args"].append(
+                    {"tool": name, "args": {"raw": tool_call.function.arguments},
+                     "reason": "malformed_json", "step": round_index,
+                     "tier": "orchestrator", "round": round_index})
+                seq_entry["args"] = {"raw": tool_call.function.arguments}
+                logger.warning("tool_call_malformed at round %d (%s): %s", round_index,
+                               name, tool_call.function.arguments)
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": "arguments were not valid JSON; retry the call"})
+                continue
+
+            seq_entry["args"] = args
+
+            if name in (DELEGATE_READ, SEARCH_AND_READ):
+                payload = _delegate(name, args, dom, maps, search_index, search_top_k,
+                                    pdf_path, metrics, round_index, seq_entry,
+                                    visuals_seen, sections_seen, subagent_model, prompts,
+                                    subagent_max_tool_calls, debug, log_subagent_details)
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": json.dumps(payload, ensure_ascii=False)})
+
+            elif name == SUBMIT_DRAFT:
+                draft = _normalize_draft(args.get("fields"), field_definitions, schema)
+                metrics["submit_draft_source"] = "tool"
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": "draft received"})
+
+            else:
+                metrics["tool_call_malformed"] += 1
+                metrics["invalid_tool_args"].append(
+                    {"tool": name, "args": args, "reason": "unknown_tool",
+                     "step": round_index, "tier": "orchestrator", "round": round_index})
+                logger.warning("unknown tool %r at round %d", name, round_index)
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": f"unknown tool {name!r}"})
+
+        if draft is not None:
+            break
+    else:
+        # Budget exhausted without a draft. The forced call below answers from the reports
+        # already gathered rather than abstaining out of exhaustion — an abstention must be
+        # a judgement on the evidence, never a side effect of the round budget.
+        metrics["hit_max_iterations"] = True
+
+    if draft is None:
+        draft = _force_submit_draft_v2(messages, submit_tool, field_definitions, schema,
+                                       model, metrics)
+        metrics["submit_draft_source"] = "forced" if draft is not None else "none"
+    if draft is None:
+        logger.error("no draft after the forced call; answering empty")
+        draft = _normalize_draft({}, field_definitions, schema)
+
+    metrics["n_unique_sections_fetched"] = len(sections_seen)
+    metrics["n_unique_visuals_fetched"] = len(visuals_seen)
+    metrics["n_cited_pages"] = sum(
+        len(entry.get("source_pages") or []) if isinstance(entry.get("source_pages"), list)
+        else 0 for entry in draft.values())
+    metrics["duration_s"] = round(time.perf_counter() - started, 2)
+    return draft, metrics, debug
+
+
+def _delegate(tool: str, args: dict[str, Any], dom: dict, maps: dict[str, Any],
+              search_index: Any, search_top_k: int, pdf_path: str | Path | None,
+              metrics: dict[str, Any], round_index: int, seq_entry: dict[str, Any],
+              visuals_seen: set[str], sections_seen: set[str], subagent_model: str,
+              prompts: dict[str, str], subagent_max_tool_calls: int,
+              debug: list[dict[str, Any]], log_subagent_details: bool) -> dict[str, Any]:
+    """Serve one delegation — both paths end in the same subagent invocation.
+
+    delegate_read and search_and_read differ only in where the candidate ids come from:
+    the orchestrator's own reading of the skeleton, or BM25. Everything after that is
+    shared, which is why they share a body.
+
+    The search path returns its hits to the orchestrator alongside the report. It costs a
+    few hundred tokens and buys back the keyword-reformulation loop the auto-forward would
+    otherwise remove: without it, seeing that a keyword reached the wrong sections would
+    cost a whole further invocation.
+
+    Args:
+        tool: DELEGATE_READ or SEARCH_AND_READ.
+        args: Parsed tool arguments.
+        dom: build_dom output.
+        maps: build_section_maps output.
+        search_index: dom_tools.build_search_index output.
+        search_top_k: Configured k, used as the default AND the ceiling.
+        pdf_path: Source PDF, or None.
+        metrics: Shared metrics dict, mutated in place.
+        round_index: Current orchestrator round.
+        seq_entry: This call's tool_sequence entry, mutated to carry the search hits.
+        visuals_seen: Run-level set of atom ids served; mutated.
+        sections_seen: Run-level set of sections delivered; mutated.
+        subagent_model: Chat model id of the reader.
+        prompts: Prompt bank.
+        subagent_max_tool_calls: Ceiling on the invocation.
+        debug: Per-invocation artefacts; appended to only when the flag is on.
+        log_subagent_details: Whether to collect them.
+
+    Returns:
+        The tool result payload, serialized by the caller.
+    """
+    focused_query = args.get("focused_query")
+    payload: dict[str, Any] = {}
+
+    if tool == SEARCH_AND_READ:
+        keyword = args.get("keyword")
+        asked = args.get("top_k")
+        top_k = asked if isinstance(asked, int) and not isinstance(asked, bool) else search_top_k
+        if top_k > search_top_k:
+            # k is the variable v2.0 holds fixed, so a model asking for more is clamped
+            # rather than obeyed — and the clamp is recorded, never silent.
+            metrics["invalid_tool_args"].append(
+                {"tool": tool, "args": {"top_k": asked}, "reason": "top_k_clamped",
+                 "step": round_index, "tier": "orchestrator", "round": round_index})
+            top_k = search_top_k
+
+        hits = search_index.search(keyword, max(top_k, 1))
+        if isinstance(hits, dict):          # refusal; empty_keyword is the only one
+            metrics["invalid_tool_args"].append(
+                {"tool": tool, "args": {"keyword": keyword}, "reason": hits["error"],
+                 "step": round_index, "tier": "orchestrator", "round": round_index})
+            return {"search": hits, "report": None}
+
+        metrics["n_search_calls"] += 1
+        metrics["search_calls"].append(keyword)
+        seq_entry["hits"] = [{"section_id": hit["section_id"], "n_matches": hit["n_matches"],
+                              "score": hit["score"]} for hit in hits]
+        candidates = [hit["section_id"] for hit in hits]
+        payload["search"] = {
+            "keyword": keyword,
+            "hits": [{"section_id": hit["section_id"], "score": round(hit["score"], 2),
+                      "n_matches": hit["n_matches"],
+                      "path": maps["crumb"].get(hit["section_id"], "")} for hit in hits],
+        }
+    else:
+        candidates = args.get("section_ids")
+
+    section_ids = resolve_section_ids(candidates, maps, metrics, round_index, tool)
+    payload["delivered"] = section_ids
+
+    if not isinstance(focused_query, str) or not focused_query.strip():
+        metrics["invalid_tool_args"].append(
+            {"tool": tool, "args": {"focused_query": focused_query},
+             "reason": "empty_focused_query", "step": round_index,
+             "tier": "orchestrator", "round": round_index})
+        payload["report"] = None
+        payload["error"] = ("focused_query is required: the reader sees neither the "
+                            "skeleton nor the question, so it needs the sub-question.")
+        return payload
+
+    report, invocation_debug = run_subagent(
+        focused_query, section_ids, dom, maps, pdf_path, metrics, round_index,
+        visuals_seen, sections_seen, model=subagent_model, prompts=prompts,
+        max_tool_calls=subagent_max_tool_calls)
+    if log_subagent_details:
+        debug.append(invocation_debug)
+
+    payload["report"] = _compact_report(report)
+    return payload
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Prompt bank of agent_dom_v2: one system/user pair per tier.
+#
+# Only the *_user_template keys go through str.format, so every literal brace — the report
+# example included — lives in a *_system key. A brace in a user template would raise.
+#
+# The MMLongBench variant of this bank is eval/mmlongbench/dom_prompts_mm_v2.yaml: same
+# four keys, benchmark wording, and it carries the numeric-format rule the rule-based
+# scoring needs. run_dom_agent_v2 takes the whole bank through `prompts=`, never merging.
+
+orchestrator_system: |-
+  You are the navigator of a question-answering system working on a parsed document.
+
+  You do NOT read the document. You receive a skeleton — an XML map of its structure — and
+  you decide WHERE the answer lives. A reader agent does the reading for you: you hand it
+  section addresses and a precise sub-question, it reads them and reports back. You never
+  see section text, and you never see an image.
+
+  ## Reading the skeleton
+
+  The root is <document_skeleton> with:
+    - doc_id: document identifier
+    - title: document title (may be absent)
+    - pages: total number of pages
+    - n_sections: total number of sections
+    - toc_present: "true" if a table of contents was detected
+
+  Each <section> has:
+    - id: the address of the section. This is what you pass to delegate_read.
+    - level: hierarchy level (1 = top). Nesting of the XML tags is authoritative;
+      `level` may be flat (all 1) when hierarchy detection was unavailable.
+    - pages: "5" for a single page, "5-12" for a range. Page numbers are 0-indexed.
+    - title: the section heading. ABSENT means the section has no usable heading.
+    - kind="front_matter": the implicit section holding everything before the first
+      heading (cover page, table of contents, front matter). Its id is always "s_toc".
+    - n_content, n_tables, n_figures: how many text blocks, tables and figures the
+      section holds directly. AN ABSENT COUNT MEANS ZERO. A section with none of these
+      three attributes is empty of direct content, but its subsections may not be.
+
+  A <section> may contain:
+    - <preview>: the first characters of the section's text. It is a truncated sample,
+      never the full content. Never answer from a preview alone.
+    - <table id="..." page="..." caption="..."/> and
+      <figure id="..." page="..." caption="..." kind="..."/>: placeholders. `caption`
+      is "(none)" when no caption was detected. kind is figure, chart or image.
+    - nested <section> elements: its subsections.
+
+  Asking for a section delivers that section AND all of its subsections, so naming a
+  parent is how you cover a whole part of the document in one delegation.
+
+  ## Tools
+
+  delegate_read(section_ids, focused_query)
+    Sends one or more sections to the reader, with the sub-question you want answered from
+    them. Use it when the skeleton already tells you where to look — a title names the
+    topic of the question, or a <table>/<figure> caption does.
+    section_ids are section ids from the skeleton. Ids of the form pN_eM are atom ids,
+    naming a table or figure INSIDE a section; they are not section ids and cannot be sent.
+    focused_query is a self-contained question. The reader does not see the user's original
+    question, does not see the skeleton and cannot search: everything it needs to know must
+    be in the sub-question you write.
+
+  search_and_read(keyword, top_k, focused_query)
+    Locates a term lexically, then sends the matching sections STRAIGHT to the reader with
+    your sub-question — one call, no stop in between. Use it when no title obviously names
+    what the question asks about, when the answer is likely buried in a paragraph, or when
+    several sections could plausibly hold it.
+    Give 2 to 5 content words, not a question. Matching is lexical, not semantic: a word
+    that is not in the document returns nothing, and a synonym will not match. You get the
+    list of sections that were sent back in the tool result, so you can see what the
+    keyword actually reached and retry with the words the document itself would use.
+
+  submit_draft(fields)
+    Ends the task. Call it exactly once, when the reports give you the answer. You report
+    the `answer`, the verbatim `quote` that supports it, and the `source_pages`.
+
+  ## Reading a report
+
+  Each report comes back as JSON and always describes what was read, even when the answer
+  was not found:
+    - candidate_answer / confidence: the reader's answer, when it was confident enough.
+    - evidence: the passages it answered from, each with its section_id, its verbatim
+      quote, and the pages that quote sits on.
+    - section_contents: one entry per section read — its topics, its key_figures (verbatim
+      numbers with their units) and the visuals it holds. This is filled even when nothing
+      was found, and it is your navigational signal: it tells you what a section actually
+      covers, so you can rule it out or follow it.
+    - recommendation: answer_ready, search_elsewhere, or try_sections with try_section_ids.
+
+  Reports accumulate across rounds. A cross-page answer is often assembled from the
+  key_figures of two different reports: combine them yourself rather than delegating again.
+
+  ## Rules
+
+  1. One delegation at a time. Read the report, then decide: answer, or delegate again
+     somewhere else. Do not re-send sections a previous report already covered.
+  2. Answer only from what the reports returned in this conversation. You may already know
+     things about this company or this document from elsewhere; that knowledge is not
+     admissible here.
+  3. `quote` must be copied character for character from an `evidence` quote of a report.
+     Do not paraphrase it, do not correct its spelling or spacing, do not translate it, and
+     do not stitch together fragments taken from different reports.
+  4. `source_pages` is copied from the `pages` of the evidence you actually used, as
+     integers, in reading order, no duplicates. NEVER derive a page from a section's
+     `pages` attribute in the skeleton, never compute one, never shift one, and never list
+     a page you did not read from. The skeleton gives ranges, not the page a sentence sits
+     on; only a report knows that.
+  5. If the reports do not answer the question, set `answer` to null, `quote` to null and
+     `source_pages` to the empty list — all three, together. Use null, never an empty
+     string. That is a correct outcome and it is scored as one. An admitted absence is
+     worth more than a wrong citation.
+  6. Your budget of delegations is limited. When it runs out you must still answer with
+     what the reports gave you rather than abstain out of exhaustion — abstain only when
+     the evidence genuinely is not there.
+  7. Call submit_draft exactly once, at the end.
+  8. Always use the tool-calling protocol. Never write a tool call, a JSON payload or your
+     final answer as plain text in your message content: it will be discarded.
+
+orchestrator_user_template: |-
+  {skeleton}
+
+  QUESTION:
+  {question}
+
+subagent_system: |-
+  You are the reader of a question-answering system working on a parsed document.
+
+  The sections you must read are ALREADY in your context, below the sub-question. You do
+  not fetch them and you cannot ask for more: you do not see the document's skeleton, you
+  cannot search, and you do not know what the rest of the document holds. Read what you
+  were given, then report.
+
+  Each section arrives as <section id="..." path="...">, where `path` is its breadcrumb —
+  the chain of headings above it, which tells you where in the document this text sits.
+  The `id` is the section_id you must name in your report.
+
+  Inside a section, the text is split by page markers: `### Start Page N ###` opens the
+  content lying on page N, `### End Page N ###` closes it. N is 0-indexed. A section
+  spanning several pages comes back as several such blocks, in reading order. Tables and
+  figures appear as [TABLE id=pN_eM] / [FIGURE id=pN_eM] markers followed by whatever text
+  OCR produced for them.
+
+  ## Tools
+
+  get_visual(atom_id)
+    Shows you the source image of ONE table or figure, plus its OCR text. atom_id is of the
+    form pN_eM, copied from a [TABLE id=...] / [FIGURE id=...] marker in the sections above
+    — never a section id.
+    Call it when the text is not enough: the visual came back with no text, its
+    transcription is truncated or garbled, or it is a chart, whose values exist only in the
+    image and are never transcribed. The section text around it is already in your context,
+    so you know what the caption and the surrounding paragraphs say — use them to read the
+    image. This tool may not be available; if it is not, work from the text alone.
+
+  report(...)
+    Ends your work and sends everything back. Call it exactly once, when you are done.
+
+  ## What to report
+
+  You never return a bare verdict. "Not found" or "low confidence" tells the navigator
+  nothing about where to go next. You DESCRIBE what you read, always, and the description
+  is what makes an unsuccessful read still useful.
+
+  An example of the shape, on a section that did answer:
+
+    candidate_answer: "EUR 4.2bn, up 8% year on year."
+    confidence: "high"
+    evidence: [
+      { "section_id": "s12",
+        "atom_id": null,
+        "quote": "Europe revenue reached EUR 4.2bn in FY23, up 8% year on year.",
+        "pages": [11] }
+    ]
+    section_contents: [
+      { "section_id": "s12",
+        "topics": ["revenue breakdown by geography", "FX impact commentary"],
+        "key_figures": ["EUR 4.2bn Europe revenue FY23", "8% YoY growth"],
+        "visuals_present": ["p12_e03: bar chart, Q4 revenue by region"] }
+    ]
+    recommendation: "answer_ready"
+    try_section_ids: []
+
+  ## Rules
+
+  1. section_contents is filled for EVERY section you were given, one entry each, whether
+     or not it answered. topics is a free paraphrase of what the section covers.
+     visuals_present is a short inventory of the tables and figures you saw, each named by
+     its atom id.
+  2. key_figures are copied VERBATIM, with their unit, exactly as the document writes them.
+     Never round them, never paraphrase them, never translate them, never convert a unit.
+     "EUR 4.2bn" is usable by the navigator; "about four billion" destroys the calculation
+     it was needed for. When a section carries no figure, give an empty list.
+  3. Fill candidate_answer and evidence when you can answer, not only when you are certain.
+     Set confidence to high, medium or low to say how sure you are. When you cannot answer
+     from what you were given, leave candidate_answer null and evidence empty — and still
+     fill section_contents.
+  4. `quote` must be an exact substring of a section you were given. Copy it character for
+     character: do not paraphrase it, do not correct its spelling or spacing, do not
+     translate it, and do not stitch together fragments taken from different places. Keep
+     it to the one sentence, line or table row that carries the answer.
+  5. `pages` on an evidence entry lists the pages that quote sits on. Take the N of the
+     nearest `### Start Page N ###` marker ABOVE the passage and copy that number. Do not
+     compute it, do not shift it, do not guess it from the breadcrumb. This is the only
+     way a page number reaches the final answer, so an evidence entry without pages is
+     evidence that cannot be cited.
+  6. recommendation tells the navigator what to do next: answer_ready when your
+     candidate_answer settles it, search_elsewhere when the evidence is not in what you
+     were given, try_sections when something you read points at another section — then put
+     its ids in try_section_ids.
+  7. Stop as soon as you can answer. You do not have to comment on every section beyond
+     its section_contents entry, and you do not have to open a visual you do not need.
+  8. Always use the tool-calling protocol. Never write a tool call, a JSON payload or your
+     report as plain text in your message content: it will be discarded.
+
+subagent_user_template: |-
+  SUB-QUESTION:
+  {focused_query}
+
+  SECTIONS:
+  {context}
+
+
+
+
+
+
+
+
+
+# MMLongBench-Doc prompt bank of agent_dom_v2 — the root bank, repointed.
+#
+# Same four keys as prompts_dom_v2.yaml, and run_dom_agent_v2 takes the whole bank through
+# `prompts=`: it never merges two, so a key missing here raises rather than falling back.
+#
+# Two deliberate deltas with the root bank:
+#   - no financial framing;
+#   - rule 9 of orchestrator_system, the numeric format the rule-based scoring of this
+#     benchmark needs. It binds `answer` only — key_figures and quote stay verbatim.
+
+orchestrator_system: |-
+  You are the navigator of a question-answering system working on a parsed document.
+
+  You do NOT read the document. You receive a skeleton — an XML map of its structure — and
+  you decide WHERE the answer lives. A reader agent does the reading for you: you hand it
+  section addresses and a precise sub-question, it reads them and reports back. You never
+  see section text, and you never see an image.
+
+  ## Reading the skeleton
+
+  The root is <document_skeleton> with:
+    - doc_id: document identifier
+    - title: document title (may be absent)
+    - pages: total number of pages
+    - n_sections: total number of sections
+    - toc_present: "true" if a table of contents was detected
+
+  Each <section> has:
+    - id: the address of the section. This is what you pass to delegate_read.
+    - level: hierarchy level (1 = top). Nesting of the XML tags is authoritative;
+      `level` may be flat (all 1) when hierarchy detection was unavailable.
+    - pages: "5" for a single page, "5-12" for a range. Page numbers are 0-indexed.
+    - title: the section heading. ABSENT means the section has no usable heading.
+    - kind="front_matter": the implicit section holding everything before the first
+      heading (cover page, table of contents, front matter). Its id is always "s_toc".
+    - n_content, n_tables, n_figures: how many text blocks, tables and figures the
+      section holds directly. AN ABSENT COUNT MEANS ZERO. A section with none of these
+      three attributes is empty of direct content, but its subsections may not be.
+
+  A <section> may contain:
+    - <preview>: the first characters of the section's text. It is a truncated sample,
+      never the full content. Never answer from a preview alone.
+    - <table id="..." page="..." caption="..."/> and
+      <figure id="..." page="..." caption="..." kind="..."/>: placeholders. `caption`
+      is "(none)" when no caption was detected. kind is figure, chart or image.
+    - nested <section> elements: its subsections.
+
+  Asking for a section delivers that section AND all of its subsections, so naming a
+  parent is how you cover a whole part of the document in one delegation.
+
+  ## Tools
+
+  delegate_read(section_ids, focused_query)
+    Sends one or more sections to the reader, with the sub-question you want answered from
+    them. Use it when the skeleton already tells you where to look — a title names the
+    topic of the question, or a <table>/<figure> caption does.
+    section_ids are section ids from the skeleton. Ids of the form pN_eM are atom ids,
+    naming a table or figure INSIDE a section; they are not section ids and cannot be sent.
+    focused_query is a self-contained question. The reader does not see the user's original
+    question, does not see the skeleton and cannot search: everything it needs to know must
+    be in the sub-question you write.
+
+  search_and_read(keyword, top_k, focused_query)
+    Locates a term lexically, then sends the matching sections STRAIGHT to the reader with
+    your sub-question — one call, no stop in between. Use it when no title obviously names
+    what the question asks about, when the answer is likely buried in a paragraph, or when
+    several sections could plausibly hold it.
+    Give 2 to 5 content words, not a question. Matching is lexical, not semantic: a word
+    that is not in the document returns nothing, and a synonym will not match. You get the
+    list of sections that were sent back in the tool result, so you can see what the
+    keyword actually reached and retry with the words the document itself would use.
+
+  submit_draft(fields)
+    Ends the task. Call it exactly once, when the reports give you the answer. You report
+    the `answer`, the verbatim `quote` that supports it, and the `source_pages`.
+
+  ## Reading a report
+
+  Each report comes back as JSON and always describes what was read, even when the answer
+  was not found:
+    - candidate_answer / confidence: the reader's answer, when it was confident enough.
+    - evidence: the passages it answered from, each with its section_id, its verbatim
+      quote, and the pages that quote sits on.
+    - section_contents: one entry per section read — its topics, its key_figures (verbatim
+      numbers with their units) and the visuals it holds. This is filled even when nothing
+      was found, and it is your navigational signal: it tells you what a section actually
+      covers, so you can rule it out or follow it.
+    - recommendation: answer_ready, search_elsewhere, or try_sections with try_section_ids.
+
+  Reports accumulate across rounds. A cross-page answer is often assembled from the
+  key_figures of two different reports: combine them yourself rather than delegating again.
+
+  ## Rules
+
+  1. One delegation at a time. Read the report, then decide: answer, or delegate again
+     somewhere else. Do not re-send sections a previous report already covered.
+  2. Answer only from what the reports returned in this conversation. You may already know
+     things about this document from elsewhere; that knowledge is not
+     admissible here.
+  3. `quote` must be copied character for character from an `evidence` quote of a report.
+     Do not paraphrase it, do not correct its spelling or spacing, do not translate it, and
+     do not stitch together fragments taken from different reports.
+  4. `source_pages` is copied from the `pages` of the evidence you actually used, as
+     integers, in reading order, no duplicates. NEVER derive a page from a section's
+     `pages` attribute in the skeleton, never compute one, never shift one, and never list
+     a page you did not read from. The skeleton gives ranges, not the page a sentence sits
+     on; only a report knows that.
+  5. If the reports do not answer the question, set `answer` to null, `quote` to null and
+     `source_pages` to the empty list — all three, together. Use null, never an empty
+     string. That is a correct outcome and it is scored as one. An admitted absence is
+     worth more than a wrong citation.
+  6. Your budget of delegations is limited. When it runs out you must still answer with
+     what the reports gave you rather than abstain out of exhaustion — abstain only when
+     the evidence genuinely is not there.
+  7. Call submit_draft exactly once, at the end.
+  8. Always use the tool-calling protocol. Never write a tool call, a JSON payload or your
+     final answer as plain text in your message content: it will be discarded.
+  9. For numeric answers, output only digits and a decimal point. No thousands separator, no
+     currency symbol, no unit written out. Percent sign and negative sign are allowed. This
+     binds `answer` only: the `key_figures` a report carries stay verbatim with their units,
+     and `quote` stays an exact copy.
+
+orchestrator_user_template: |-
+  {skeleton}
+
+  QUESTION:
+  {question}
+
+subagent_system: |-
+  You are the reader of a question-answering system working on a parsed document.
+
+  The sections you must read are ALREADY in your context, below the sub-question. You do
+  not fetch them and you cannot ask for more: you do not see the document's skeleton, you
+  cannot search, and you do not know what the rest of the document holds. Read what you
+  were given, then report.
+
+  Each section arrives as <section id="..." path="...">, where `path` is its breadcrumb —
+  the chain of headings above it, which tells you where in the document this text sits.
+  The `id` is the section_id you must name in your report.
+
+  Inside a section, the text is split by page markers: `### Start Page N ###` opens the
+  content lying on page N, `### End Page N ###` closes it. N is 0-indexed. A section
+  spanning several pages comes back as several such blocks, in reading order. Tables and
+  figures appear as [TABLE id=pN_eM] / [FIGURE id=pN_eM] markers followed by whatever text
+  OCR produced for them.
+
+  ## Tools
+
+  get_visual(atom_id)
+    Shows you the source image of ONE table or figure, plus its OCR text. atom_id is of the
+    form pN_eM, copied from a [TABLE id=...] / [FIGURE id=...] marker in the sections above
+    — never a section id.
+    Call it when the text is not enough: the visual came back with no text, its
+    transcription is truncated or garbled, or it is a chart, whose values exist only in the
+    image and are never transcribed. The section text around it is already in your context,
+    so you know what the caption and the surrounding paragraphs say — use them to read the
+    image. This tool may not be available; if it is not, work from the text alone.
+
+  report(...)
+    Ends your work and sends everything back. Call it exactly once, when you are done.
+
+  ## What to report
+
+  You never return a bare verdict. "Not found" or "low confidence" tells the navigator
+  nothing about where to go next. You DESCRIBE what you read, always, and the description
+  is what makes an unsuccessful read still useful.
+
+  An example of the shape, on a section that did answer:
+
+    candidate_answer: "EUR 4.2bn, up 8% year on year."
+    confidence: "high"
+    evidence: [
+      { "section_id": "s12",
+        "atom_id": null,
+        "quote": "Europe revenue reached EUR 4.2bn in FY23, up 8% year on year.",
+        "pages": [11] }
+    ]
+    section_contents: [
+      { "section_id": "s12",
+        "topics": ["revenue breakdown by geography", "FX impact commentary"],
+        "key_figures": ["EUR 4.2bn Europe revenue FY23", "8% YoY growth"],
+        "visuals_present": ["p12_e03: bar chart, Q4 revenue by region"] }
+    ]
+    recommendation: "answer_ready"
+    try_section_ids: []
+
+  ## Rules
+
+  1. section_contents is filled for EVERY section you were given, one entry each, whether
+     or not it answered. topics is a free paraphrase of what the section covers.
+     visuals_present is a short inventory of the tables and figures you saw, each named by
+     its atom id.
+  2. key_figures are copied VERBATIM, with their unit, exactly as the document writes them.
+     Never round them, never paraphrase them, never translate them, never convert a unit.
+     "EUR 4.2bn" is usable by the navigator; "about four billion" destroys the calculation
+     it was needed for. When a section carries no figure, give an empty list.
+  3. Fill candidate_answer and evidence when you can answer, not only when you are certain.
+     Set confidence to high, medium or low to say how sure you are. When you cannot answer
+     from what you were given, leave candidate_answer null and evidence empty — and still
+     fill section_contents.
+  4. `quote` must be an exact substring of a section you were given. Copy it character for
+     character: do not paraphrase it, do not correct its spelling or spacing, do not
+     translate it, and do not stitch together fragments taken from different places. Keep
+     it to the one sentence, line or table row that carries the answer.
+  5. `pages` on an evidence entry lists the pages that quote sits on. Take the N of the
+     nearest `### Start Page N ###` marker ABOVE the passage and copy that number. Do not
+     compute it, do not shift it, do not guess it from the breadcrumb. This is the only
+     way a page number reaches the final answer, so an evidence entry without pages is
+     evidence that cannot be cited.
+  6. recommendation tells the navigator what to do next: answer_ready when your
+     candidate_answer settles it, search_elsewhere when the evidence is not in what you
+     were given, try_sections when something you read points at another section — then put
+     its ids in try_section_ids.
+  7. Stop as soon as you can answer. You do not have to comment on every section beyond
+     its section_contents entry, and you do not have to open a visual you do not need.
+  8. Always use the tool-calling protocol. Never write a tool call, a JSON payload or your
+     report as plain text in your message content: it will be discarded.
+
+subagent_user_template: |-
+  SUB-QUESTION:
+  {focused_query}
+
+  SECTIONS:
+  {context}
+
+
+
+
+
+
+
+
+
+
+"""MMLongBench-Doc runner of the v2 agent — run_mm, repointed at agent_dom_v2.
+
+Twin of eval/finragbench/run_v2.py, differing only where run_mm already differs from
+run_benchmark: this benchmark's dataset and its own prompt bank, a gold-free row joined by
+query_id at scoring time, and a question-to-document match on an explicit `stem` field
+rather than a prefix test on the query id.
+
+Nothing in run_mm is modified: its constants, load_or_build_dom, pdf_for and aggregate_run
+are imported and reused, and the scoring chain stays extract_run then score_run.
+
+SAMPLING. The default reproduces what a run_mm run does today, exactly: load_samples()
+over every question, and `limit` as a global cap consumed document by document in sorted
+order — a head truncation, not a draw. That is what keeps a v2 run comparable with the v1
+runs already on disk, which is the whole point of v2.0. dataset.sample_dataset draws a
+STRATIFIED subsample (on answerability x evidence sources) but nothing in the repo calls
+it; it is wired here behind `p`, off by default, because turning it on changes the question
+set and breaks that comparison unless v1 is re-run on the same draw.
+"""
+
+import json
+import logging
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import yaml
+from tqdm import tqdm
+
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parents[1]
+sys.path.insert(0, str(_REPO))   # repo root, for agent_dom_v2 and eval.rate_limit
+sys.path.insert(0, str(_HERE))   # eval/mmlongbench/, for dataset, run_mm, extract, score
+
+# Imported as a MODULE, not by value: every budget is read at call time, so setting
+# agent_dom_v2.SEARCH_TOP_K in a notebook cell before the run actually takes effect and
+# lands in run_metadata.json. Binding the constants here would freeze them at import and
+# silently run an arm you did not configure.
+import agent_dom_v2                                          # noqa: E402
+from agent_dom_v2 import run_dom_agent_v2                    # noqa: E402
+from dataset import load_samples, sample_dataset            # noqa: E402
+from eval.rate_limit import is_infra_failure, log_failure   # noqa: E402
+from extract import extract_run                             # noqa: E402
+from openai import BadRequestError                          # noqa: E402
+from run_mm import ARTIFACTS, RUNS, aggregate_run, load_or_build_dom, pdf_for  # noqa: E402
+from score_mm import score_run                              # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# This benchmark's own v2 bank: the root bank minus the financial framing, plus the numeric
+# format rule the rule-based scoring needs. run_dom_agent_v2 otherwise reads the
+# FinRAGBench one at import, so it is handed over whole — never merged.
+PROMPTS_PATH = _HERE / "dom_prompts_mm_v2.yaml"
+with PROMPTS_PATH.open(encoding="utf-8") as f:
+    PROMPTS_MM_V2 = yaml.safe_load(f)
+
+FIELD_DEFINITIONS = {"qa": "Answer the question grounded in the document."}
+
+DEBUG_DIR_NAME = "debug_v2"
+
+_SEMANTIC_NOTE = (
+    "agent v2 (orchestrator + ephemeral subagent). n_steps = LLM calls of BOTH tiers. "
+    "get_section_calls = sections PRE-LOADED for the subagent, so used_section means "
+    "'delivered', not 'the model chose to read'. There is no get_section tool in v2."
+)
+
+
+def _init_run_v2(run_id: str, notes: str, log_subagent_details: bool,
+                 p: float | None, seed: int) -> Path:
+    """The run directory, created with its metadata on first use.
+
+    run_metadata.json is written ONCE per run_id: a later call on the same run is a
+    continuation, and rewriting it would move created_at away from the code that actually
+    produced the earliest rows.
+
+    Args:
+        run_id: Name of this benchmark iteration.
+        notes: Free text describing what this run changes.
+        log_subagent_details: Whether this run dumps the heavy artefacts.
+        p: Stratified sampling fraction, or None for the full question list.
+        seed: Seed of that draw; recorded so the sample can be rebuilt.
+
+    Returns:
+        The eval/mmlongbench/runs/{run_id} directory.
+    """
+    run_dir = RUNS / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = run_dir / "run_metadata.json"
+    if not metadata.exists():
+        metadata.write_text(json.dumps({
+            "run_id": run_id,
+            "benchmark": "MMLongBench-Doc",
+            "agent": "agent_dom_v2",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "notes": f"{_SEMANTIC_NOTE} {notes}".strip(),
+            "ORCHESTRATOR_MODEL": agent_dom_v2.ORCHESTRATOR_MODEL,
+            "SUBAGENT_MODEL": agent_dom_v2.SUBAGENT_MODEL,
+            "ORCHESTRATOR_MAX_ROUNDS": agent_dom_v2.ORCHESTRATOR_MAX_ROUNDS,
+            "SEARCH_TOP_K": agent_dom_v2.SEARCH_TOP_K,
+            "SUBAGENT_MAX_TOOL_CALLS": agent_dom_v2.SUBAGENT_MAX_TOOL_CALLS,
+            "LOG_SUBAGENT_DETAILS": log_subagent_details,
+            "FIELD_DEFINITIONS": FIELD_DEFINITIONS,
+            "prompts": PROMPTS_PATH.name,
+            "sample_p": p,
+            "sample_seed": seed if p is not None else None,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return run_dir
+
+
+def run_one(dom: dict, skeleton: str, sample: dict, pdf_path: Path | None = None,
+            log_subagent_details: bool = False) -> tuple[dict, list[dict]]:
+    """Answer one question and build its result row; an agent failure becomes `error`.
+
+    Row shape is run_mm.run_one's, field for field — gold-free, joined by query_id in
+    score_mm — so extraction and scoring do not branch on which agent produced it.
+
+    `pred_source_pages` is written EXACTLY as the model sent it, with no coercion: the
+    schema is advisory on this endpoint, so a scalar or a malformed entry is a fact about
+    the run and metrics.as_pages normalizes it at read time.
+
+    Args:
+        dom: The document's DOM.
+        skeleton: Its XML skeleton.
+        sample: One entry of dataset.load_samples.
+        pdf_path: The source PDF, or None to keep the call text-only.
+        log_subagent_details: Collect the heavy per-invocation artefacts.
+
+    Returns:
+        `(row, debug)`. debug is empty unless log_subagent_details is on, and never enters
+        the row.
+    """
+    started = time.perf_counter()
+    debug: list[dict] = []
+    try:
+        draft, metrics, debug = run_dom_agent_v2(
+            dom, skeleton, FIELD_DEFINITIONS, mode="qa", question=sample["question"],
+            pdf_path=pdf_path, prompts=PROMPTS_MM_V2,
+            max_rounds=agent_dom_v2.ORCHESTRATOR_MAX_ROUNDS,
+            model=agent_dom_v2.ORCHESTRATOR_MODEL,
+            subagent_model=agent_dom_v2.SUBAGENT_MODEL,
+            search_top_k=agent_dom_v2.SEARCH_TOP_K,
+            subagent_max_tool_calls=agent_dom_v2.SUBAGENT_MAX_TOOL_CALLS,
+            log_subagent_details=log_subagent_details)
+        answer, error = draft["qa"], None
+    except BadRequestError as e:
+        answer, metrics, error = {}, {}, f"{type(e).__name__}: {e}"
+    metrics["wall_clock_s"] = round(time.perf_counter() - started, 2)
+
+    return {
+        "query_id": sample["query_id"],
+        "doc_id": sample["doc_id"],
+        "stem": sample["stem"],
+        "question": sample["question"],
+        "pred_answer": answer.get("answer"),
+        "pred_quote": answer.get("quote"),
+        "pred_source_pages": answer.get("source_pages"),
+        "agent_metrics": metrics,
+        "error": error,
+    }, debug
+
+
+def _dump_debug(run_dir: Path, query_id: str, debug: list[dict]) -> None:
+    """Write one question's subagent artefacts under the run's debug subdirectory."""
+    out_dir = run_dir / DEBUG_DIR_NAME
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / f"{query_id}.json").write_text(
+        json.dumps(debug, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def run_mm_v2(run_id: str, limit: int | None = None, notes: str = "",
+           log_subagent_details: bool = False,
+           p: float | None = None, seed: int = 42) -> None:
+    """Run every pending question of one v2 iteration, one JSONL file per document.
+
+    A question already present in the run's file is skipped. That is a crash net, not a
+    resume mode: to start over, pass a new run_id.
+
+    Args:
+        run_id: Name of this iteration; results land in eval/mmlongbench/runs/{run_id}/.
+        limit: Stop after N questions in total (pilot runs); None runs them all. This is
+            the mechanism a run_mm run uses today — keep it to stay comparable.
+        notes: What this run changes, recorded in run_metadata.json on creation.
+        log_subagent_details: Dump each invocation's report, pre-loaded context and
+            key_figures verdicts under runs/{run_id}/debug_v2/.
+        p: Fraction of a STRATIFIED draw (dataset.sample_dataset). None, the default, takes
+            every question, which is what today's runs do. Setting it changes the question
+            set and breaks comparability with the runs already on disk.
+        seed: Seed of that draw; a same (p, seed) rebuilds the same sample.
+    """
+    samples = load_samples() if p is None else sample_dataset(p, seed)
+    run_dir = _init_run_v2(run_id, notes, log_subagent_details, p, seed)
+    done_total = 0
+
+    # doc_ocr.json is the real prerequisite: the DOM is derived from it on first use, and
+    # the artifacts are shared with the v1 runs, so both arms read the same frozen DOM.
+    for ocr_path in sorted(ARTIFACTS.glob("*/doc_ocr.json")):
+        doc_dir = ocr_path.parent
+        results = run_dir / f"{doc_dir.name}.jsonl"
+
+        done = set()
+        if results.exists():
+            done = {json.loads(line)["query_id"]
+                    for line in results.read_text(encoding="utf-8").splitlines()
+                    if line.strip()}
+
+        pending = [s for s in samples
+                   if s["stem"] == doc_dir.name and s["query_id"] not in done]
+        if limit is not None:
+            pending = pending[:limit - done_total]
+        if not pending:
+            continue
+
+        # Loaded or built once per document, not once per question. The PDF is resolved
+        # here too: its presence is a property of the document, not of the question.
+        dom, skeleton = load_or_build_dom(doc_dir)
+        pdf_path = pdf_for(doc_dir.name)
+
+        print(f"[{run_id}] [{doc_dir.name}] {len(pending)} questions, {len(done)} déjà faites")
+
+        # Appended and flushed per question: a crash keeps every answer already paid for.
+        with results.open("a", encoding="utf-8") as out:
+            bar = tqdm(pending, desc=doc_dir.name[:30], unit="q")
+            for sample in bar:
+                bar.set_postfix_str(sample["query_id"][-8:])
+                # An endpoint failure is an ABSENCE of measurement, so it writes no row:
+                # the resume filter keys on query_id and replays the question on the next
+                # launch. A row would freeze it as done — and here it would render as
+                # "Not answerable" and score 1.0 against an unanswerable gold.
+                try:
+                    row, debug = run_one(dom, skeleton, sample, pdf_path,
+                                         log_subagent_details)
+                except Exception as e:
+                    if not is_infra_failure(e):
+                        raise
+                    log_failure(run_dir, sample["query_id"], e)
+                    continue
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                out.flush()
+                if debug:
+                    _dump_debug(run_dir, sample["query_id"], debug)
+
+        done_total += len(pending)
+        if limit is not None and done_total >= limit:
+            break
+
+
+def run_and_score(run_id: str, limit: int | None = None, notes: str = "",
+                  log_subagent_details: bool = False,
+                  p: float | None = None, seed: int = 42) -> Path:
+    """The whole chain in one call: run, aggregate, extract, score.
+
+    The three post-hoc stages are run_mm's, extract's and score_mm's own, unchanged: a v2
+    run is aggregated, extracted and scored exactly like a v1 run.
+
+    Args:
+        run_id: Name of this iteration.
+        limit: Stop after N questions in total; None runs them all.
+        notes: What this run changes.
+        log_subagent_details: Dump the heavy per-invocation artefacts.
+        p: Stratified sampling fraction, or None for every question.
+        seed: Seed of that draw.
+
+    Returns:
+        Path of the scoring output.
+    """
+    run_mm_v2(run_id, limit=limit, notes=notes,
+              log_subagent_details=log_subagent_details, p=p, seed=seed)
+    aggregate_run(run_id)
+    extract_run(run_id)
+    return score_run(run_id)
+
+
+
+
+
+
+# ── Cellule 1 : chemins + réglage de l'arm ────────────────────────────────
+import _path                                  # eval/mmlongbench/, eval/, racine repo
+
+import agent_dom_v2
+agent_dom_v2.SEARCH_TOP_K            = 5      # le k de cet arm
+agent_dom_v2.ORCHESTRATOR_MAX_ROUNDS = 3
+agent_dom_v2.SUBAGENT_MAX_TOOL_CALLS = 6
+# agent_dom_v2.SUBAGENT_MODEL = "..."         # v2.2 seulement, pas maintenant
+
+# ── Cellule 2 : le run ────────────────────────────────────────────────────
+from run_mm_v2 import run_mm_v2
+
+run_mm_v2(
+    "v2_mm_pilot1",
+    limit=20,                                 # même mécanisme qu'aujourd'hui
+    notes="v2.0 archi seule, meme modele deux etages, top_k=5, rounds=3",
+    log_subagent_details=True,                # dump debug_v2/, utile sur un pilote
+)
+
+# ── Cellule 3 : scoring, chaîne MM inchangée ──────────────────────────────
+from run_mm import aggregate_run
+from extract import extract_run
+from score_mm import score_run, sanity_counters
+
+aggregate_run("v2_mm_pilot1")
+extract_run("v2_mm_pilot1")                   # GPT-OSS, séquentiel par défaut
+score_run("v2_mm_pilot1")
+sanity_counters("v2_mm_pilot1")               # à lire AVANT de croire le F1
+
+
+
+
+
+
+
+
+
+
+
