@@ -1,0 +1,9 @@
+import json
+from run_mm import RUNS
+
+d = RUNS / "v2_mm_pilot1"
+for f in sorted(d.glob("*.jsonl")):
+    lines = [l for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
+    bad = [i for i, l in enumerate(lines) if "pred_answer" not in json.loads(l)]
+    print(f"{f.name:35} {len(lines):4} lignes, {len(bad):3} sans pred_answer",
+          bad[:3] if bad else "")
