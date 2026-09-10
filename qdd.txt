@@ -1,0 +1,6 @@
+from run_mm import RUNS, aggregate_run
+
+d = RUNS / "v2_mm_pilot1"
+(d / "failures.jsonl").rename(d / "failures.bak")   # plus un .jsonl -> plus ramassé
+(d / "all.jsonl").unlink()
+aggregate_run("v2_mm_pilot1")                        # doit afficher 106
