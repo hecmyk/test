@@ -1,0 +1,17 @@
+import json
+from run_mm import RUNS, aggregate_run
+
+d = RUNS / "v2_mm_pilot1"
+DERIVED = {"all.jsonl", "extracted.jsonl", "scored.jsonl", "failures.jsonl"}
+
+for f in sorted(d.glob("*.jsonl")):
+    if f.name in DERIVED:
+        continue
+    lines = [l for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
+    keep = [l for l in lines if "pred_answer" in json.loads(l)]
+    if len(keep) != len(lines):
+        print(f.name, ":", len(lines) - len(keep), "ligne(s) retirée(s)")
+        f.write_text("\n".join(keep) + "\n", encoding="utf-8")
+
+(d / "all.jsonl").unlink()
+aggregate_run("v2_mm_pilot1")
