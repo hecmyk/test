@@ -1,0 +1,17 @@
+import json
+from run_mm import RUNS, aggregate_run
+
+d = RUNS / "v2_mm_pilot1"
+
+# 1. voir la ligne fautive
+for l in (d / "all.jsonl").read_text(encoding="utf-8").splitlines():
+    if l.strip() and "pred_answer" not in json.loads(l):
+        print("FAUTIVE:", json.loads(l))
+
+# 2. régénérer proprement
+(d / "all.jsonl").unlink()
+aggregate_run("v2_mm_pilot1")
+
+# 3. vérifier
+lines = [json.loads(l) for l in (d / "all.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+print(len(lines), "lignes,", sum("pred_answer" not in r for r in lines), "sans pred_answer")
