@@ -1,0 +1,331 @@
+"""Analyses d'un run MMLongBench, sur le scored.jsonl produit par score_mm.py.
+
+Tout le volet outils de eval/analyze.py est réutilisé tel quel — il ne lit que
+agent_metrics, identique d'un benchmark et d'une version d'agent à l'autre. Seul le
+chargement est propre à MMLong : la note s'appelle `score` et non `judge_score`, il n'y
+a ni token_f1 ni page_recall, et le gold (answer, answer_format, doc_type,
+evidence_pages, evidence_sources) est déjà recopié dans scored.jsonl.
+
+Conventions de pages. Le gold `evidence_pages` est 1-indexé ; le DOM (page_start,
+page_end, l'id pN_eM d'un atome) et `pred_source_pages` sont 0-indexés. Tout ce que ce
+module AFFICHE est 1-indexé, converti ici et nulle part ailleurs.
+"""
+
+import ast
+import json
+import re
+import sys
+from functools import lru_cache
+from pathlib import Path
+
+import pandas as pd
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))       # eval/, pour analyze
+sys.path.insert(0, str(_HERE))              # eval/mmlongbench/
+
+import analyze                                          # noqa: E402
+from dataset import _strata                             # noqa: E402
+from official.eval_score import eval_acc_and_f1         # noqa: E402
+
+RUNS = _HERE / "runs"
+ARTIFACTS = _HERE / "artifacts"
+NOT_ANSWERABLE = "Not answerable"
+_ATOM_PAGE = re.compile(r"^p(\d+)_e\d+$")
+
+# Les libellés du dataset, joignables par leur mot usuel.
+SOURCE_ALIASES = {
+    "pure-text": "Pure-text (Plain-text)", "text": "Pure-text (Plain-text)",
+    "layout": "Generalized-text (Layout)", "table": "Table", "chart": "Chart",
+    "figure": "Figure", "image": "Figure", "aucune": "(aucune)", "none": "(aucune)",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Chargement                                                                   #
+# --------------------------------------------------------------------------- #
+def _read_jsonl(path: Path) -> list[dict]:
+    """Les lignes d'un JSONL ; liste vide si le fichier manque."""
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()
+            if l.strip()]
+
+
+def load_scored_mm(run_id: str) -> pd.DataFrame:
+    """Le scored.jsonl d'un run, à plat, avec les colonnes dérivées MMLong.
+
+    Adapté de analyze.load_scored. L'`outcome` ne contient pas "abstention" : ici une
+    abstention sur un gold non-répondable vaut 1.0 et ne peut donc pas écraser "correct".
+    Elle sort en colonnes booléennes à part, côté agent et côté scoring officiel.
+
+    Args:
+        run_id: L'itération à charger.
+
+    Returns:
+        Une ligne par question scorée, agent_metrics aplaties.
+    """
+    df = pd.json_normalize(_read_jsonl(RUNS / run_id / "scored.jsonl"))
+    df.columns = [c.replace("agent_metrics.", "").replace("tokens.", "tokens_")
+                  for c in df.columns]
+    for col in ("tool_sequence", "invalid_tool_args", "get_section_calls",
+                "get_visual_calls"):
+        if col not in df.columns:
+            df[col] = [[] for _ in range(len(df))]
+
+    strata = df.apply(_strata, axis=1)
+    df["answerability"] = [s[0] for s in strata]
+    df["evidence_sources_l"] = [list(s[1]) or ["(aucune)"] for s in strata]
+    df["evidence_pages_l"] = df["evidence_pages"].map(ast.literal_eval)
+    df["n_evidence_pages"] = df["evidence_pages_l"].str.len()
+
+    outcome = pd.Series("wrong", index=df.index)
+    outcome[df["score"] == 1] = "correct"
+    outcome[df["score"].isna()] = "unparsed"
+    outcome[df["error"].notna()] = "error"
+    df["outcome"] = outcome
+    df["abstention_agent"] = df["pred_answer"].isna()
+    df["abstention_pred"] = df["pred"] == NOT_ANSWERABLE
+    df["gold_unanswerable"] = df["answer"] == NOT_ANSWERABLE
+    df["tokens_per_step"] = df["tokens_total"] / df["n_steps"]
+    df["n_invalid"] = df["invalid_tool_args"].str.len()
+
+    for tool in analyze.TOOL_SPECS:
+        df[f"attempts_{tool}"] = analyze._attempts(df, tool)
+        df[f"used_{tool}"] = df[f"attempts_{tool}"] > 0
+    df["attempts"] = sum(df[f"attempts_{t}"] for t in analyze.TOOL_SPECS)
+    df["tool_set"] = analyze._tool_set_labels(df, pd.Series(True, index=df.index))
+    return df
+
+
+def notee(df: pd.DataFrame) -> list[dict]:
+    """Les lignes que le scoring officiel compte, au format qu'il attend.
+
+    json_normalize crée `score` pour TOUTES les lignes, NaN comprises, alors que
+    eval_acc_and_f1 filtre sur la PRÉSENCE de la clé : sans ce filtre les non-parsées
+    entrent dans les sommes et tout sort NaN.
+    """
+    return df[df["score"].notna()].to_dict("records")
+
+
+def quality_by_mm(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    """Accuracy, F1 officiel et abstention groupés par `column`.
+
+    Le F1 est délégué à eval_acc_and_f1 : sur un groupe sans aucun gold répondable, son
+    dénominateur de rappel est nul et il rend 0.0 — ce n'est pas un score, c'est une
+    division impossible. Seuls le F1 global et ceux des groupes mixtes se lisent.
+
+    Args:
+        df: Sortie de load_scored_mm.
+        column: Colonne de groupement.
+
+    Returns:
+        Une ligne par groupe, le plus gros d'abord.
+    """
+    g = df.groupby(column)
+    table = pd.DataFrame({
+        "n": g.size(),
+        "accuracy": g["score"].mean(),
+        "f1": g.apply(lambda d: eval_acc_and_f1(notee(d))[1], include_groups=False),
+        "abstention": g["abstention_pred"].mean(),
+        "cap_rate": g["hit_max_iterations"].mean(),
+        "tokens_mean": g["tokens_total"].mean(),
+    })
+    return table.sort_values("n", ascending=False).round(3)
+
+
+# --------------------------------------------------------------------------- #
+# DOM : ce que l'agent a lu, en pages                                          #
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=None)
+def _dom(stem: str) -> dict:
+    """Le doc_dom.json d'un document, lu une fois par session."""
+    return json.loads((ARTIFACTS / stem / "doc_dom.json").read_text(encoding="utf-8"))
+
+
+def _section_pages(dom: dict) -> dict[str, tuple[int, int]]:
+    """section_id -> (page_start, page_end) 0-indexés, sur tout l'arbre."""
+    out = {}
+
+    def walk(sections: list[dict]) -> None:
+        for s in sections:
+            out[s["section_id"]] = (s["page_start"], s["page_end"])
+            walk(s["subsections"])
+
+    walk(dom["tree"]["sections"])
+    return out
+
+
+def pages_read(row: pd.Series) -> dict:
+    """Les pages qu'une question a réellement lues, reconstruites des traces.
+
+    get_section_calls porte des ids sN : le DOM donne leur étendue de pages.
+    get_visual_calls porte des ids pN_eM : la page est dans l'id. Les deux traces
+    contiennent aussi les appels refusés (id inconnu) — ceux-là ne mappent sur rien et
+    sont ignorés, ce qui est le bon comportement : un refus n'a rien fait lire.
+
+    Args:
+        row: Une ligne de load_scored_mm.
+
+    Returns:
+        `sections` [(id, p_start, p_end)], `visuals` [(id, page)], `pages` triées —
+        tout 1-indexé.
+    """
+    spans = _section_pages(_dom(row["stem"]))
+    sections, pages = [], set()
+    for sid in dict.fromkeys(row["get_section_calls"]):       # dédoublonné, ordre gardé
+        if sid in spans and spans[sid][0] is not None:
+            a, b = spans[sid]
+            sections.append((sid, a + 1, b + 1))
+            pages.update(range(a + 1, b + 2))
+    visuals = []
+    for aid in dict.fromkeys(row["get_visual_calls"]):
+        m = _ATOM_PAGE.match(str(aid))
+        if m:
+            visuals.append((aid, int(m.group(1)) + 1))
+            pages.add(int(m.group(1)) + 1)
+    return {"sections": sections, "visuals": visuals, "pages": sorted(pages)}
+
+
+# --------------------------------------------------------------------------- #
+# 1 & 2 — accuracy selon l'évidence                                            #
+# --------------------------------------------------------------------------- #
+def accuracy_by_n_evidence(df: pd.DataFrame) -> pd.DataFrame:
+    """Accuracy selon le nombre de pages d'évidence : 0 (non-répondable), 1, 2, 3, 4+.
+
+    La ligne 0 est un autre régime — elle mesure l'abstention, pas la lecture — et se
+    lit à part des quatre autres.
+
+    Args:
+        df: Sortie de load_scored_mm.
+
+    Returns:
+        Une ligne par tranche, dans l'ordre des tranches.
+    """
+    bucket = df["n_evidence_pages"].clip(upper=4).map(
+        lambda k: {0: "0 (non-répondable)", 4: "4+"}.get(k, str(k)))
+    table = quality_by_mm(df.assign(n_pages_evidence=bucket), "n_pages_evidence")
+    return table.sort_index()
+
+
+def accuracy_by_evidence_page(df: pd.DataFrame, width: int = 10,
+                              cap: int = 60) -> pd.DataFrame:
+    """Accuracy selon la PREMIÈRE page d'évidence, par tranches de `width` pages.
+
+    Une page 35 n'existe que dans un document d'au moins 35 pages : la tranche absolue
+    mesure aussi la longueur du document. `rel_pos_mean` (page / page_count) est donné
+    à côté pour séparer les deux effets. Les non-répondables, sans page, sont exclues.
+
+    Args:
+        df: Sortie de load_scored_mm.
+        width: Largeur des tranches de pages.
+        cap: Au-delà, tout est replié dans une dernière tranche "cap+1+".
+
+    Returns:
+        Une ligne par tranche, de la première à la dernière.
+    """
+    d = df[df["n_evidence_pages"] > 0].copy()
+    d["first_page"] = d["evidence_pages_l"].map(min)
+    d["page_count"] = d["stem"].map(lambda s: _dom(s)["header"]["page_count"])
+    d["rel_pos"] = d["first_page"] / d["page_count"]
+    # `lo` reste une colonne numérique : l'ordre des tranches se lit dessus, jamais en
+    # re-parsant le libellé — une page d'évidence à 0 dans le gold donne un lo négatif.
+    d["lo"] = ((d["first_page"] - 1) // width * width + 1).clip(upper=cap + 1)
+    d["tranche"] = (d["lo"].astype(str) + "-" + (d["lo"] + width - 1).astype(str)
+                    ).where(d["lo"] <= cap, f"{cap + 1}+")
+    g = d.groupby("tranche")
+    table = pd.DataFrame({
+        "lo": g["lo"].min(),
+        "n": g.size(),
+        "accuracy": g["score"].mean(),
+        "abstention": g["abstention_pred"].mean(),
+        "rel_pos_mean": g["rel_pos"].mean(),
+        "page_count_mean": g["page_count"].mean(),
+    })
+    return table.sort_values("lo").drop(columns="lo").round(3)
+
+
+# --------------------------------------------------------------------------- #
+# 3 — outils par catégorie                                                     #
+# --------------------------------------------------------------------------- #
+def tools_by_source(df: pd.DataFrame, column: str = "evidence_sources_l") -> pd.DataFrame:
+    """Usage de chaque outil par catégorie : taux d'usage ET tentatives moyennes.
+
+    Multi-label par défaut : une question comptée dans chacune de ses sources. Le taux
+    d'usage (part des questions ayant appelé l'outil au moins une fois) répond à
+    « sous-appelé ? » mieux que la moyenne, qu'une poignée de questions boulimiques
+    suffit à tirer.
+
+    Sur un run v2, get_section_calls sont les sections PRÉ-CHARGÉES du sous-agent,
+    pas un choix du modèle : `use_section` y veut dire « livrées ».
+
+    Args:
+        df: Sortie de load_scored_mm.
+        column: Colonne de groupement ; explosée si elle contient des listes.
+
+    Returns:
+        Une ligne par catégorie, la plus grosse d'abord.
+    """
+    d = df.explode(column) if df[column].map(lambda v: isinstance(v, list)).any() else df
+    g = d.groupby(column)
+    table = pd.DataFrame({"n": g.size(), "accuracy": g["score"].mean()})
+    for tool in ("visual", "section", "search"):
+        table[f"use_{tool}"] = g[f"used_{tool}"].mean()
+        table[f"att_{tool}"] = g[f"attempts_{tool}"].mean()
+    table["att_total"] = g["attempts"].mean()
+    if "subagent_invocations" in d.columns:
+        print("run v2 : use_section = sections pré-chargées, pas un choix du modèle")
+    return table.sort_values("n", ascending=False).round(3)
+
+
+# --------------------------------------------------------------------------- #
+# 4 — inspection                                                               #
+# --------------------------------------------------------------------------- #
+def inspect_worst(run_id: str, source: str, n: int = 5) -> pd.DataFrame:
+    """Les N questions les plus mal répondues d'une source de preuve, en clair.
+
+    Tri : score croissant, puis réponses affirmatives avant abstentions (une réponse
+    fausse assumée en dit plus qu'un renoncement), puis coût décroissant. Les lignes
+    non parsées n'ont pas de score et ne sont pas classées.
+
+    Args:
+        run_id: L'itération à inspecter.
+        source: "Pure-text", "Layout", "Table", "Chart", "Figure" ou "aucune".
+        n: Nombre de questions à afficher.
+
+    Returns:
+        Les lignes affichées, pour le travail ad hoc.
+    """
+    label = SOURCE_ALIASES.get(source.lower().strip(), source)
+    df = load_scored_mm(run_id)
+    sub = df[df["evidence_sources_l"].map(lambda l: label in l)]
+    scored = sub[sub["score"].notna()]
+    raw = {e["query_id"]: e.get("extracted_res", "") for e in
+           _read_jsonl(RUNS / run_id / "extracted.jsonl")}
+
+    print(f"=== {run_id} | {label} ===")
+    print(f"{len(sub)} questions, {len(scored)} scorées, accuracy {scored['score'].mean():.3f}"
+          f" | {(scored['score'] == 0).sum()} à zéro")
+    worst = scored.sort_values(["score", "abstention_pred", "tokens_total"],
+                               ascending=[True, True, False]).head(n)
+
+    for k, (_, r) in enumerate(worst.iterrows(), 1):
+        read = pages_read(r)
+        cited = sorted(p + 1 for p in (r["pred_source_pages"] or []) if isinstance(p, int))
+        print(f"\n{'-' * 78}\n{k}/{len(worst)}  score {r['score']:.2f}   {r['query_id']}")
+        print(f"PDF         {r['doc_id']}  ({r['doc_type']}, "
+              f"{_dom(r['stem'])['header']['page_count']} p.)")
+        print(f"question    {r['question']}")
+        print(f"gold        {r['answer']!r}  [{r['answer_format']}]")
+        print(f"évidence    pages {r['evidence_pages_l']}  sources {r['evidence_sources_l']}")
+        print(f"agent       {r['pred_answer']!r}  ({r['submit_draft_source']}, "
+              f"{int(r['n_steps'])} tours, {int(r['tokens_total']) // 1000}k tok)")
+        if r["pred_quote"]:
+            print(f"citation    {str(r['pred_quote'])[:160]!r}")
+        print(f"pages citées {cited}")
+        secs = " ".join(f"{s}(p.{a}-{b})" if a != b else f"{s}(p.{a})"
+                        for s, a, b in read["sections"])
+        vis = " ".join(f"{a}(p.{p})" for a, p in read["visuals"])
+        print(f"pages lues  {read['pages']}   sections: {secs or '-'}   crops: {vis or '-'}")
+        print(f"extracteur  {raw.get(r['query_id'], '')[:200]!r}  ->  pred {r['pred']!r}")
+    return worst
