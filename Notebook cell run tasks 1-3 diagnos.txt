@@ -1,0 +1,788 @@
+"""Notebook cell: run tasks 1-3 diagnostics on one run_id without a terminal.
+
+Usage in a notebook cell:
+    RUN_ID = "your_run_id"
+    %run scratch/run_diagnostics.py
+"""
+
+import runpy
+import sys
+
+RUN_ID = globals().get("RUN_ID", "CHANGE_ME")
+BENCHMARK = globals().get("BENCHMARK", "auto")  # "finragbench" | "mmlongbench" | "auto"
+
+_SCRIPTS = [
+    "scratch/task1_compact_report_caps.py",
+    "scratch/task2_invalid_tool_args_distribution.py",
+    "scratch/task3_descriptive_fallback_reach.py",
+]
+
+for _script in _SCRIPTS:
+    print(f"\n{'=' * 80}\n{_script}\n{'=' * 80}")
+    sys.argv = [_script, RUN_ID, "--benchmark", BENCHMARK]
+    try:
+        runpy.run_path(_script, run_name="__main__")
+    except SystemExit as e:
+        if e.code:
+            print(f"[exited: {e.code}]")
+
+
+
+
+
+
+
+
+"""Task 1 — do the _compact_report caps (REPORT_MAX_LIST_ITEMS, REPORT_ITEM_CHARS) bite?
+
+Reads the raw (pre-_compact_report) subagent reports dumped under
+runs/{run_id}/debug_v2/*.json (one JSON list of invocation records per query, written only
+when LOG_SUBAGENT_DETAILS was True for that run) and measures, over every
+`section_contents` entry of every invocation of every query:
+
+  - len(topics) and, when non-empty, max(len(item) for item in topics)
+  - the same two distributions for visuals_present
+
+against the caps agent_dom_v2.py applies before a report reaches the orchestrator
+(REPORT_MAX_LIST_ITEMS = 6 items, REPORT_ITEM_CHARS = 120 chars/item). Read-only: does not
+import or execute agent_dom_v2, only reads the dumped JSON.
+
+Usage:
+    python scratch/task1_compact_report_caps.py RUN_ID [--benchmark finragbench|mmlongbench|auto]
+                                                 [--max-items 6] [--item-chars 120]
+"""
+
+import argparse
+import json
+import statistics
+import sys
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEBUG_DIR_NAME = "debug_v2"
+
+BENCHMARK_RUN_DIRS = {
+    "finragbench": REPO_ROOT / "eval" / "finragbench" / "runs",
+    "mmlongbench": REPO_ROOT / "eval" / "mmlongbench" / "runs",
+}
+
+
+def find_debug_dir(run_id: str, benchmark: str) -> Path:
+    """Locate runs/{run_id}/debug_v2 under the requested benchmark(s), or exit with a message."""
+    candidates = (
+        [BENCHMARK_RUN_DIRS[benchmark]] if benchmark != "auto"
+        else list(BENCHMARK_RUN_DIRS.values())
+    )
+    found = [d / run_id / DEBUG_DIR_NAME for d in candidates if (d / run_id / DEBUG_DIR_NAME).is_dir()]
+    if not found:
+        checked = ", ".join(str(d / run_id / DEBUG_DIR_NAME) for d in candidates)
+        sys.exit(f"no debug_v2 directory found for run_id={run_id!r}. Checked: {checked}\n"
+                 f"(debug_v2 only exists when the run was launched with log_subagent_details=True)")
+    if len(found) > 1:
+        sys.exit(f"run_id={run_id!r} exists under both benchmarks ({found}); "
+                 f"pass --benchmark to disambiguate.")
+    return found[0]
+
+
+def load_invocations(debug_dir: Path) -> list[dict[str, Any]]:
+    """Flatten every per-query debug_v2/*.json (each a list of invocation records) into one list."""
+    invocations: list[dict[str, Any]] = []
+    files = sorted(debug_dir.glob("*.json"))
+    if not files:
+        sys.exit(f"{debug_dir} exists but holds no *.json files")
+    for path in files:
+        try:
+            records = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"WARNING: skipping unparseable {path.name}: {e}", file=sys.stderr)
+            continue
+        if isinstance(records, list):
+            invocations.extend(r for r in records if isinstance(r, dict))
+    print(f"{len(files)} debug_v2 files -> {len(invocations)} subagent invocations")
+    return invocations
+
+
+def collect_entries(invocations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every section_contents entry across every invocation's raw report."""
+    entries: list[dict[str, Any]] = []
+    for inv in invocations:
+        report = inv.get("report")
+        if not isinstance(report, dict):
+            continue
+        section_contents = report.get("section_contents")
+        if isinstance(section_contents, list):
+            entries.extend(e for e in section_contents if isinstance(e, dict))
+    return entries
+
+
+def percentile(values: list[float], pct: float) -> float:
+    """Nearest-rank percentile on a pre-sorted-on-demand list; 0 for an empty input."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    k = (len(ordered) - 1) * (pct / 100)
+    lo, hi = int(k), min(int(k) + 1, len(ordered) - 1)
+    if lo == hi:
+        return ordered[lo]
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (k - lo)
+
+
+def field_lengths(entries: list[dict[str, Any]], field: str) -> tuple[list[int], list[int]]:
+    """Per-entry len(field) and per-entry max item length (0 when the list is empty)."""
+    lens: list[int] = []
+    max_item_lens: list[int] = []
+    for entry in entries:
+        value = entry.get(field)
+        items = [i for i in value if isinstance(i, str)] if isinstance(value, list) else []
+        lens.append(len(items))
+        max_item_lens.append(max((len(i) for i in items), default=0))
+    return lens, max_item_lens
+
+
+def describe(values: list[int]) -> dict[str, float]:
+    if not values:
+        return {"min": 0, "max": 0, "mean": 0, "median": 0, "p95": 0, "p99": 0}
+    return {
+        "min": min(values),
+        "max": max(values),
+        "mean": round(statistics.mean(values), 2),
+        "median": statistics.median(values),
+        "p95": round(percentile(values, 95), 2),
+        "p99": round(percentile(values, 99), 2),
+    }
+
+
+def print_table(title: str, stats: dict[str, float], n_over: int, total: int, threshold_desc: str) -> None:
+    print(f"\n{title}")
+    print("-" * len(title))
+    print(f"{'min':>8} {'max':>8} {'mean':>8} {'median':>8} {'p95':>8} {'p99':>8}")
+    print(f"{stats['min']:>8} {stats['max']:>8} {stats['mean']:>8} "
+         f"{stats['median']:>8} {stats['p95']:>8} {stats['p99']:>8}")
+    pct = round(100 * n_over / total, 1) if total else 0.0
+    print(f"entries {threshold_desc}: {n_over}/{total} ({pct}%)")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_id")
+    parser.add_argument("--benchmark", choices=["finragbench", "mmlongbench", "auto"], default="auto")
+    parser.add_argument("--max-items", type=int, default=6,
+                       help="REPORT_MAX_LIST_ITEMS at the time of the run (default: 6)")
+    parser.add_argument("--item-chars", type=int, default=120,
+                       help="REPORT_ITEM_CHARS at the time of the run (default: 120)")
+    args = parser.parse_args()
+
+    debug_dir = find_debug_dir(args.run_id, args.benchmark)
+    print(f"reading {debug_dir}")
+    invocations = load_invocations(debug_dir)
+    entries = collect_entries(invocations)
+    total = len(entries)
+    print(f"{total} section_contents entries total")
+    if total == 0:
+        sys.exit("no section_contents entries found; nothing to measure")
+
+    bite_pct: dict[str, float] = {}
+    for field in ("topics", "visuals_present"):
+        lens, max_item_lens = field_lengths(entries, field)
+
+        n_len_over = sum(1 for v in lens if v > args.max_items)
+        n_chars_over = sum(1 for v in max_item_lens if v > args.item_chars)
+        n_either = sum(1 for v1, v2 in zip(lens, max_item_lens)
+                      if v1 > args.max_items or v2 > args.item_chars)
+
+        print_table(f"len({field}) distribution", describe(lens), n_len_over, total,
+                   f"with len > {args.max_items}")
+        print_table(f"max(len(item) for item in {field}) distribution",
+                   describe(max_item_lens), n_chars_over, total,
+                   f"with an item > {args.item_chars} chars")
+
+        bite_pct[field] = round(100 * n_either / total, 1)
+
+    print("\n=== Conclusion ===")
+    print(f"caps mordent sur {bite_pct['topics']}% des entrées pour topics, "
+         f"{bite_pct['visuals_present']}% pour visuals_present "
+         f"(sur {total} entrées, run {args.run_id})")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+"""Task 2 — distribution of `reason` inside agent_metrics.invalid_tool_args.
+
+Reads runs/{run_id}/scored.jsonl (falls back to all.jsonl if the run was not scored yet)
+and aggregates, over every row's agent_metrics.invalid_tool_args entries:
+
+  - count and questions_touched per (reason, tier)
+  - the same rolled up per reason alone (all tiers combined)
+
+Known reasons in agent_dom_v2.py: empty_keyword, empty_focused_query, top_k_clamped,
+unknown_section_id, malformed_json, unknown_tool. Anything else found is reported too,
+not dropped.
+
+Usage:
+    python scratch/task2_invalid_tool_args_distribution.py RUN_ID [--benchmark finragbench|mmlongbench|auto]
+"""
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+BENCHMARK_RUN_DIRS = {
+    "finragbench": REPO_ROOT / "eval" / "finragbench" / "runs",
+    "mmlongbench": REPO_ROOT / "eval" / "mmlongbench" / "runs",
+}
+
+SCORED_NAME = "scored.jsonl"
+AGGREGATE_NAME = "all.jsonl"
+
+
+def find_results_file(run_id: str, benchmark: str) -> Path:
+    """runs/{run_id}/scored.jsonl if it exists, else runs/{run_id}/all.jsonl."""
+    candidates = (
+        [BENCHMARK_RUN_DIRS[benchmark]] if benchmark != "auto"
+        else list(BENCHMARK_RUN_DIRS.values())
+    )
+    run_dirs = [d / run_id for d in candidates if (d / run_id).is_dir()]
+    if not run_dirs:
+        checked = ", ".join(str(d / run_id) for d in candidates)
+        sys.exit(f"no run directory found for run_id={run_id!r}. Checked: {checked}")
+    if len(run_dirs) > 1:
+        sys.exit(f"run_id={run_id!r} exists under both benchmarks ({run_dirs}); "
+                 f"pass --benchmark to disambiguate.")
+    run_dir = run_dirs[0]
+
+    scored = run_dir / SCORED_NAME
+    if scored.exists():
+        return scored
+    aggregate = run_dir / AGGREGATE_NAME
+    if aggregate.exists():
+        print(f"WARNING: {SCORED_NAME} not found, falling back to {AGGREGATE_NAME} "
+             f"(run not scored yet)", file=sys.stderr)
+        return aggregate
+    sys.exit(f"neither {scored} nor {aggregate} exist")
+
+
+def load_rows(path: Path) -> list[dict[str, Any]]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    print(f"{len(rows)} rows loaded from {path}")
+    return rows
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_id")
+    parser.add_argument("--benchmark", choices=["finragbench", "mmlongbench", "auto"], default="auto")
+    args = parser.parse_args()
+
+    path = find_results_file(args.run_id, args.benchmark)
+    rows = load_rows(path)
+
+    # (reason, tier) -> {"count": int, "questions": set}
+    by_reason_tier: dict[tuple[str, str], dict[str, Any]] = defaultdict(
+        lambda: {"count": 0, "questions": set()})
+    # reason -> {"count": int, "questions": set}  (tiers rolled up)
+    by_reason: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "questions": set()})
+
+    n_rows_with_entries = 0
+    for row in rows:
+        query_id = row.get("query_id")
+        entries = (row.get("agent_metrics") or {}).get("invalid_tool_args") or []
+        if entries:
+            n_rows_with_entries += 1
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            reason = entry.get("reason", "<missing>")
+            tier = entry.get("tier", "<missing>")
+
+            bucket = by_reason_tier[(reason, tier)]
+            bucket["count"] += 1
+            bucket["questions"].add(query_id)
+
+            rolled = by_reason[reason]
+            rolled["count"] += 1
+            rolled["questions"].add(query_id)
+
+    total_entries = sum(b["count"] for b in by_reason.values())
+    print(f"{total_entries} invalid_tool_args entries across {n_rows_with_entries}/{len(rows)} "
+         f"questions\n")
+
+    print("=== By (reason, tier) ===")
+    print(f"{'reason':<22} {'tier':<14} {'count':>7} {'questions_touched':>18}")
+    for (reason, tier), bucket in sorted(by_reason_tier.items(), key=lambda kv: -kv[1]["count"]):
+        print(f"{reason:<22} {tier:<14} {bucket['count']:>7} {len(bucket['questions']):>18}")
+
+    print("\n=== By reason (tiers combined) ===")
+    print(f"{'reason':<22} {'count':>7} {'questions_touched':>18}")
+    for reason, bucket in sorted(by_reason.items(), key=lambda kv: -kv[1]["count"]):
+        print(f"{reason:<22} {bucket['count']:>7} {len(bucket['questions']):>18}")
+
+    print("\n=== Reasons of interest ===")
+    for reason in ("empty_focused_query", "top_k_clamped", "empty_keyword"):
+        bucket = by_reason.get(reason)
+        if bucket:
+            print(f"{reason}: {bucket['count']} occurrences, {len(bucket['questions'])} questions touched")
+        else:
+            print(f"{reason}: 0 occurrences")
+
+    known = {"empty_keyword", "empty_focused_query", "top_k_clamped", "unknown_section_id",
+             "malformed_json", "unknown_tool"}
+    unknown_reasons = sorted(set(by_reason) - known)
+    if unknown_reasons:
+        print(f"\nUnexpected reasons not in the known list: {unknown_reasons}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+"""Task 3 — is `_descriptive_fallback` actually reached?
+
+Reads runs/{run_id}/scored.jsonl (falls back to all.jsonl) and counts, over every
+agent_metrics.subagent_stats entry of every question:
+
+  - report_source == "none"    -> the forced report call also failed: final descriptive
+                                   fallback (_descriptive_fallback in agent_dom_v2.py)
+  - section_ids == []          -> nothing was loaded (unknown ids / empty search hit): the
+                                   descriptive fallback fires BEFORE any LLM call at all
+  - report_source == "forced"  -> the model never called `report` itself, but the forced
+                                   call on the report tool succeeded (bonus counter)
+
+plus the total invocation count for reference (percentages are computed against it).
+
+Usage:
+    python scratch/task3_descriptive_fallback_reach.py RUN_ID [--benchmark finragbench|mmlongbench|auto]
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+BENCHMARK_RUN_DIRS = {
+    "finragbench": REPO_ROOT / "eval" / "finragbench" / "runs",
+    "mmlongbench": REPO_ROOT / "eval" / "mmlongbench" / "runs",
+}
+
+SCORED_NAME = "scored.jsonl"
+AGGREGATE_NAME = "all.jsonl"
+
+
+def find_results_file(run_id: str, benchmark: str) -> Path:
+    candidates = (
+        [BENCHMARK_RUN_DIRS[benchmark]] if benchmark != "auto"
+        else list(BENCHMARK_RUN_DIRS.values())
+    )
+    run_dirs = [d / run_id for d in candidates if (d / run_id).is_dir()]
+    if not run_dirs:
+        checked = ", ".join(str(d / run_id) for d in candidates)
+        sys.exit(f"no run directory found for run_id={run_id!r}. Checked: {checked}")
+    if len(run_dirs) > 1:
+        sys.exit(f"run_id={run_id!r} exists under both benchmarks ({run_dirs}); "
+                 f"pass --benchmark to disambiguate.")
+    run_dir = run_dirs[0]
+
+    scored = run_dir / SCORED_NAME
+    if scored.exists():
+        return scored
+    aggregate = run_dir / AGGREGATE_NAME
+    if aggregate.exists():
+        print(f"WARNING: {SCORED_NAME} not found, falling back to {AGGREGATE_NAME} "
+             f"(run not scored yet)", file=sys.stderr)
+        return aggregate
+    sys.exit(f"neither {scored} nor {aggregate} exist")
+
+
+def load_rows(path: Path) -> list[dict[str, Any]]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    print(f"{len(rows)} rows loaded from {path}")
+    return rows
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_id")
+    parser.add_argument("--benchmark", choices=["finragbench", "mmlongbench", "auto"], default="auto")
+    args = parser.parse_args()
+
+    path = find_results_file(args.run_id, args.benchmark)
+    rows = load_rows(path)
+
+    total_invocations = 0
+    n_source_none = 0
+    n_empty_section_ids = 0
+    n_source_forced = 0
+    n_both_none_and_empty = 0   # sanity cross-check: empty section_ids implies report_source "none"
+
+    questions_with_none = set()
+    questions_with_empty_section_ids = set()
+    questions_with_forced = set()
+
+    for row in rows:
+        query_id = row.get("query_id")
+        stats = (row.get("agent_metrics") or {}).get("subagent_stats") or []
+        for inv in stats:
+            if not isinstance(inv, dict):
+                continue
+            total_invocations += 1
+            source = inv.get("report_source")
+            section_ids = inv.get("section_ids")
+            is_empty = isinstance(section_ids, list) and len(section_ids) == 0
+
+            if source == "none":
+                n_source_none += 1
+                questions_with_none.add(query_id)
+            if is_empty:
+                n_empty_section_ids += 1
+                questions_with_empty_section_ids.add(query_id)
+            if source == "none" and is_empty:
+                n_both_none_and_empty += 1
+            if source == "forced":
+                n_source_forced += 1
+                questions_with_forced.add(query_id)
+
+    def pct(n: int) -> float:
+        return round(100 * n / total_invocations, 1) if total_invocations else 0.0
+
+    print(f"\ntotal subagent invocations: {total_invocations}\n")
+    print(f"report_source == 'none'   (forced call also failed):  {n_source_none:>5} "
+         f"({pct(n_source_none)}%), {len(questions_with_none)} questions touched")
+    print(f"section_ids == []         (nothing loaded, no LLM call): {n_empty_section_ids:>5} "
+         f"({pct(n_empty_section_ids)}%), {len(questions_with_empty_section_ids)} questions touched")
+    print(f"report_source == 'forced' (forced call saved it):     {n_source_forced:>5} "
+         f"({pct(n_source_forced)}%), {len(questions_with_forced)} questions touched")
+
+    print(f"\nsanity: of the section_ids==[] invocations, {n_both_none_and_empty} also have "
+         f"report_source=='none' (expected: all of them, since an empty load short-circuits "
+         f"before any LLM call and returns _descriptive_fallback with report_source left at "
+         f"its 'none' default)")
+    if n_both_none_and_empty != n_empty_section_ids:
+        print("MISMATCH: some section_ids==[] invocations do NOT have report_source=='none' — "
+             "check agent_dom_v2.run_subagent's early-return path before trusting the counts above.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+# Task 4 — feasibility: key_figures_check / page_range_check -> verifications.jsonl
+
+## 1. Where the `.append` calls sit today
+
+Exactly two append sites, one function each, one call site each:
+
+- `check_key_figures` (agent_dom_v2.py:531-571): one `metrics["key_figures_check"].append(...)`
+  at line 569, inside a loop over `report["section_contents"][*]["key_figures"]`. The verdict
+  computation (`exact` / `normalized` / `absent` / `unknown_section`) stays useful either way —
+  only the sink changes.
+- `check_page_ranges` (agent_dom_v2.py:574-611): one `metrics["page_range_check"].append(...)`
+  at line 609, inside a loop over `report["evidence"][*]["pages"]`.
+
+Both are called from a single site: `run_subagent` (agent_dom_v2.py:843-844), once per
+subagent invocation — i.e. multiple times per question, once per `delegate_read` /
+`search_and_read`. The two list keys are also declared in `_init_metrics_v2` (lines 163,
+165). Total surface: 2 functions (bodies mostly unchanged, just re-pointed), 2 init lines
+swapped for 2 new proportion keys, 1 call site untouched. Small and localized — no fan-out.
+
+## 2. Where/when verifications.jsonl gets written
+
+`run_dom_agent_v2` has no `run_id` or `question_id` — those only exist one level up, in each
+runner's `run_one` (eval/finragbench/run_v2.py, eval/mmlongbench/run_mm_v2.py). So the raw
+lists can't be written from inside agent_dom_v2.py; they have to travel out first. Cleanest
+option: extend the existing debug-triple-return pattern (`draft, metrics, debug`) with the
+two raw lists — either folded into the `debug` payload or as a 4th return value — computed
+into the two proportions for `metrics`, kept in full alongside. The write itself mirrors
+`_dump_debug`: one call in each runner's `run_one`, right after `run_dom_agent_v2` returns,
+appending one line `{"question_id": ..., "key_figures_check": [...], "page_range_check":
+[...]}` to `runs/{run_id}/verifications.jsonl` — same append-and-flush discipline as the
+per-document results files. Both runners need the change (they already duplicate `run_one`
+rather than share it, same as every other v1/v2 split in this repo).
+
+## 3. Who consumes these keys today
+
+Grepped the whole repo: `key_figures_check`, `page_range_check` and `subagent_stats` appear
+nowhere outside `agent_dom_v2.py` and `README_dom_agent_v2.md` (docs only). Neither
+`eval/analyze.py`, `eval/mmlongbench/analyze_mm.py`, `eval/finragbench/score_results.py` nor
+`eval/mmlongbench/score_mm.py` name them.
+
+One caveat: `analyze.load_scored` does `pd.json_normalize(rows)` over the whole row, so these
+two keys currently surface as ordinary (list-typed) DataFrame columns *generically*, with no
+code naming them. Nobody reads them by name in the repo, but an ad-hoc notebook cell doing
+`df.key_figures_check.explode()` would silently lose that column after the move — a notebook
+risk, not a repo-code risk.
+
+**Conclusion: the refactor is safe on the consumption side.** No runner, scorer or analyze
+module needs updating. The only real work is #1 (contained inside agent_dom_v2.py) and #2
+(one small addition, duplicated across the two v2 runners).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Task 5 — empirically test the tool_call -> tool_result -> user ordering constraint.
+
+agent_dom_v2.run_subagent buffers image crops in `image_parts` and appends them as ONE
+`role: "user"` message AFTER every tool_call of an assistant turn has received its
+`role: "tool"` result. The comment in the code claims: "all tool results of an assistant
+turn must be answered before another role opens, or the next request 400s."
+
+This script tries to get the model to make two `get_page_image` tool_calls in the same
+assistant turn, then sends the SAME conversation prefix through two different follow-up
+orderings against the real endpoint:
+
+  Ordering A (buffered, what the code does today):
+    [assistant(2 tool_calls), tool_result_1, tool_result_2, user(image_1, image_2)]
+
+  Ordering B (interleaved, what the code avoids):
+    [assistant(2 tool_calls), tool_result_1, user(image_1), tool_result_2, user(image_2)]
+
+Standalone, one-shot: no retry loop on API errors (a 400 IS the measurement), no rate-limit
+handling. Does not import or modify agent_dom_v2.py.
+
+Usage (CLI flags override env vars; env vars override the hardcoded defaults below):
+    python scratch/test_openai_interleave.py \\
+        --pdf path/to/doc.pdf \\
+        --endpoint http://datacamp-llm-api.../v1/openai \\
+        --api-key sk-... \\
+        --model mistral-medium-3.5
+
+Env vars: PDF_PATH, OPENAI_BASE_URL (or MISTRAL_BASE_URL), OPENAI_API_KEY (or
+MISTRAL_API_KEY), OPENAI_MODEL (or MISTRAL_AGENT_MODEL).
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+
+import fitz  # PyMuPDF
+from openai import APIStatusError, OpenAI
+
+TOOL_NAME = "get_page_image"
+
+DEFAULT_ENDPOINT = "http://datacamp-llm-api.datacamp-llm-api-production/v1/openai"
+DEFAULT_MODEL = "mistral-medium-3.5"
+
+FIRST_PROMPT = "Get the image of page 0 and page 1, then describe both."
+EXPLICIT_PROMPT = ("Call `get_page_image` twice in the same turn, once with page_num=0 and "
+                   "once with page_num=1. Do not answer in text yet, only make the two "
+                   "tool calls.")
+
+TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": TOOL_NAME,
+        "description": "Get the rasterized image of one page of the PDF, by 0-indexed page number.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "page_num": {"type": "integer", "description": "0-indexed page number."},
+            },
+            "required": ["page_num"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pdf", default=os.environ.get("PDF_PATH"),
+                       help="Path to a PDF with at least 2 pages.")
+    parser.add_argument("--endpoint",
+                       default=os.environ.get("OPENAI_BASE_URL")
+                       or os.environ.get("MISTRAL_BASE_URL", DEFAULT_ENDPOINT))
+    parser.add_argument("--api-key",
+                       default=os.environ.get("OPENAI_API_KEY")
+                       or os.environ.get("MISTRAL_API_KEY", "None"))
+    parser.add_argument("--model",
+                       default=os.environ.get("OPENAI_MODEL")
+                       or os.environ.get("MISTRAL_AGENT_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--dpi", type=int, default=150)
+    parser.add_argument("--max-attempts", type=int, default=4,
+                       help="How many tries to get 2 tool_calls in one turn before giving up.")
+    args = parser.parse_args()
+    if not args.pdf:
+        sys.exit("no PDF given: pass --pdf or set PDF_PATH")
+    return args
+
+
+def rasterize_page_b64(pdf_path: str, page_num: int, dpi: int) -> str:
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num >= doc.page_count:
+            sys.exit(f"PDF only has {doc.page_count} pages, cannot rasterize page {page_num}")
+        page = doc.load_page(page_num)
+        pix = page.get_pixmap(dpi=dpi)
+        return base64.b64encode(pix.tobytes("png")).decode("utf-8")
+    finally:
+        doc.close()
+
+
+def image_content_block(page_num: int, b64_png: str) -> list[dict]:
+    return [
+        {"type": "text", "text": f"Image of page {page_num}:"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_png}"}},
+    ]
+
+
+def get_two_tool_calls(client: OpenAI, model: str, max_attempts: int):
+    """Retry with an increasingly explicit prompt until the assistant emits 2 tool_calls.
+
+    Returns (messages_prefix, tool_call_1, tool_call_2, page_1, page_2) or exits on failure.
+    """
+    for attempt in range(1, max_attempts + 1):
+        prompt = FIRST_PROMPT if attempt == 1 else EXPLICIT_PROMPT
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant with tool access."},
+            {"role": "user", "content": prompt},
+        ]
+        print(f"[attempt {attempt}] prompt={prompt!r}")
+        try:
+            response = client.chat.completions.create(
+                model=model, messages=messages, tools=[TOOL_DEF])
+        except APIStatusError as e:
+            print(f"  API error on the FIRST call itself: {e.status_code} {e.response.text[:500]}")
+            continue
+
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+        print(f"  -> {len(tool_calls)} tool_call(s)")
+
+        if len(tool_calls) == 2:
+            pages = []
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                pages.append(args.get("page_num"))
+            if None in pages:
+                print(f"  tool_calls did not carry a usable page_num ({pages}), retrying")
+                continue
+            messages.append(message.model_dump(exclude_none=True))
+            return messages, tool_calls[0], tool_calls[1], pages[0], pages[1]
+
+    sys.exit(f"could not get the model to make 2 tool_calls in one turn after "
+             f"{max_attempts} attempts")
+
+
+def try_ordering(client: OpenAI, model: str, label: str, messages: list[dict]) -> tuple[bool, str]:
+    """Send `messages` as a follow-up request. Returns (ok, detail)."""
+    try:
+        response = client.chat.completions.create(model=model, messages=messages, tools=[TOOL_DEF])
+    except APIStatusError as e:
+        return False, f"HTTP {e.status_code}: {e.response.text[:1000]}"
+    except Exception as e:  # defensive: anything else the SDK can raise
+        return False, f"{type(e).__name__}: {e}"
+
+    message = response.choices[0].message
+    detail = (f"content={message.content!r} "
+             f"tool_calls={[tc.function.name for tc in (message.tool_calls or [])]}")
+    return True, detail
+
+
+def main() -> None:
+    args = parse_args()
+    client = OpenAI(base_url=args.endpoint, api_key=args.api_key)
+
+    print(f"endpoint={args.endpoint} model={args.model} pdf={args.pdf}\n")
+
+    b64_page0 = rasterize_page_b64(args.pdf, 0, args.dpi)
+    b64_page1 = rasterize_page_b64(args.pdf, 1, args.dpi)
+    images_by_page = {0: b64_page0, 1: b64_page1}
+
+    messages_prefix, call_1, call_2, page_1, page_2 = get_two_tool_calls(
+        client, args.model, args.max_attempts)
+    print(f"\ngot 2 tool_calls: call_1 -> page {page_1}, call_2 -> page {page_2}\n")
+
+    image_1 = image_content_block(page_1, images_by_page[page_1])
+    image_2 = image_content_block(page_2, images_by_page[page_2])
+
+    # Ordering A — buffered (current code): both tool results, THEN one user message
+    # carrying both images.
+    messages_a = messages_prefix + [
+        {"role": "tool", "tool_call_id": call_1.id, "content": "see image below"},
+        {"role": "tool", "tool_call_id": call_2.id, "content": "see image below"},
+        {"role": "user", "content": image_1 + image_2},
+    ]
+
+    # Ordering B — interleaved: a user message opens between the two tool results.
+    messages_b = messages_prefix + [
+        {"role": "tool", "tool_call_id": call_1.id, "content": "see image below"},
+        {"role": "user", "content": image_1},
+        {"role": "tool", "tool_call_id": call_2.id, "content": "see image below"},
+        {"role": "user", "content": image_2},
+    ]
+
+    print("=== Ordering A (buffered) ===")
+    ok_a, detail_a = try_ordering(client, args.model, "A", messages_a)
+    print(f"{'OK' if ok_a else 'KO'} — {detail_a}\n")
+
+    print("=== Ordering B (interleaved) ===")
+    ok_b, detail_b = try_ordering(client, args.model, "B", messages_b)
+    print(f"{'OK' if ok_b else 'KO'} — {detail_b}\n")
+
+    print(f"=== Verdict === A: {'OK' if ok_a else 'KO'} — B: {'OK' if ok_b else 'KO'}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+RUN_ID = "ton_run_id"
+BENCHMARK = "mmlongbench"  # ou "finragbench" / "auto"
+
+%run -i ../../scratch/run_diagnostics.py
+
+
+
+
