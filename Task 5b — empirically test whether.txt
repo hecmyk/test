@@ -1,0 +1,214 @@
+"""Task 5b — empirically test whether a `role: "tool"` message can carry image content.
+
+`scratch/test_openai_interleave.py` established that on our endpoint Ordering A (every
+tool result first, THEN one `role: "user"` message carrying all the images) works, while
+Ordering B (a user image message interleaved between two tool results) returns HTTP 400.
+
+Neither covered a third possibility: putting the image directly INSIDE the `role: "tool"`
+message as multimodal content, with no follow-up user message at all. Recent OpenAI spec
+updates allow this in principle, but support is endpoint-dependent — this script measures
+what our internal endpoint actually does.
+
+Same conversation prefix, two follow-up orderings:
+
+  Ordering A (baseline, known to work — kept as a sanity check):
+    [assistant(2 tool_calls), tool_result_1, tool_result_2, user(image_1, image_2)]
+
+  Ordering C (the variant under test):
+    [assistant(2 tool_calls),
+     tool_result_1(content=[text, image_url]),
+     tool_result_2(content=[text, image_url])]      <- no trailing user message
+
+Standalone, one-shot: no retry loop on API errors (a 400 IS the measurement), no rate-limit
+handling. Does not import or modify agent_dom_v2.py.
+
+Usage (CLI flags override env vars; env vars override the hardcoded defaults below):
+    python scratch/test_openai_tool_image_content.py \\
+        --pdf path/to/doc.pdf \\
+        --endpoint http://datacamp-llm-api.../v1/openai \\
+        --api-key sk-... \\
+        --model mistral-medium-3.5
+
+Env vars: PDF_PATH, OPENAI_BASE_URL (or MISTRAL_BASE_URL), OPENAI_API_KEY (or
+MISTRAL_API_KEY), OPENAI_MODEL (or MISTRAL_AGENT_MODEL).
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+
+import fitz  # PyMuPDF
+from openai import APIStatusError, OpenAI
+
+TOOL_NAME = "get_page_image"
+
+DEFAULT_ENDPOINT = "http://datacamp-llm-api.datacamp-llm-api-production/v1/openai"
+DEFAULT_MODEL = "mistral-medium-3.5"
+
+FIRST_PROMPT = "Get the image of page 0 and page 1, then describe both."
+EXPLICIT_PROMPT = ("Call `get_page_image` twice in the same turn, once with page_num=0 and "
+                   "once with page_num=1. Do not answer in text yet, only make the two "
+                   "tool calls.")
+
+TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": TOOL_NAME,
+        "description": "Get the rasterized image of one page of the PDF, by 0-indexed page number.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "page_num": {"type": "integer", "description": "0-indexed page number."},
+            },
+            "required": ["page_num"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pdf", default=os.environ.get("PDF_PATH"),
+                       help="Path to a PDF with at least 2 pages.")
+    parser.add_argument("--endpoint",
+                       default=os.environ.get("OPENAI_BASE_URL")
+                       or os.environ.get("MISTRAL_BASE_URL", DEFAULT_ENDPOINT))
+    parser.add_argument("--api-key",
+                       default=os.environ.get("OPENAI_API_KEY")
+                       or os.environ.get("MISTRAL_API_KEY", "None"))
+    parser.add_argument("--model",
+                       default=os.environ.get("OPENAI_MODEL")
+                       or os.environ.get("MISTRAL_AGENT_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--dpi", type=int, default=150)
+    parser.add_argument("--max-attempts", type=int, default=4,
+                       help="How many tries to get 2 tool_calls in one turn before giving up.")
+    args = parser.parse_args()
+    if not args.pdf:
+        sys.exit("no PDF given: pass --pdf or set PDF_PATH")
+    return args
+
+
+def rasterize_page_b64(pdf_path: str, page_num: int, dpi: int) -> str:
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num >= doc.page_count:
+            sys.exit(f"PDF only has {doc.page_count} pages, cannot rasterize page {page_num}")
+        page = doc.load_page(page_num)
+        pix = page.get_pixmap(dpi=dpi)
+        return base64.b64encode(pix.tobytes("png")).decode("utf-8")
+    finally:
+        doc.close()
+
+
+def image_content_block(page_num: int, b64_png: str) -> list[dict]:
+    return [
+        {"type": "text", "text": f"Image of page {page_num}:"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_png}"}},
+    ]
+
+
+def get_two_tool_calls(client: OpenAI, model: str, max_attempts: int):
+    """Retry with an increasingly explicit prompt until the assistant emits 2 tool_calls.
+
+    Returns (messages_prefix, tool_call_1, tool_call_2, page_1, page_2) or exits on failure.
+    """
+    for attempt in range(1, max_attempts + 1):
+        prompt = FIRST_PROMPT if attempt == 1 else EXPLICIT_PROMPT
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant with tool access."},
+            {"role": "user", "content": prompt},
+        ]
+        print(f"[attempt {attempt}] prompt={prompt!r}")
+        try:
+            response = client.chat.completions.create(
+                model=model, messages=messages, tools=[TOOL_DEF])
+        except APIStatusError as e:
+            print(f"  API error on the FIRST call itself: {e.status_code} {e.response.text[:500]}")
+            continue
+
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+        print(f"  -> {len(tool_calls)} tool_call(s)")
+
+        if len(tool_calls) == 2:
+            pages = []
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                pages.append(args.get("page_num"))
+            if None in pages:
+                print(f"  tool_calls did not carry a usable page_num ({pages}), retrying")
+                continue
+            messages.append(message.model_dump(exclude_none=True))
+            return messages, tool_calls[0], tool_calls[1], pages[0], pages[1]
+
+    sys.exit(f"could not get the model to make 2 tool_calls in one turn after "
+             f"{max_attempts} attempts")
+
+
+def try_ordering(client: OpenAI, model: str, label: str, messages: list[dict]) -> tuple[bool, str]:
+    """Send `messages` as a follow-up request. Returns (ok, detail)."""
+    try:
+        response = client.chat.completions.create(model=model, messages=messages, tools=[TOOL_DEF])
+    except APIStatusError as e:
+        return False, f"HTTP {e.status_code}: {e.response.text[:1000]}"
+    except Exception as e:  # defensive: anything else the SDK can raise
+        return False, f"{type(e).__name__}: {e}"
+
+    message = response.choices[0].message
+    detail = (f"content={message.content!r} "
+             f"tool_calls={[tc.function.name for tc in (message.tool_calls or [])]}")
+    return True, detail
+
+
+def main() -> None:
+    args = parse_args()
+    client = OpenAI(base_url=args.endpoint, api_key=args.api_key)
+
+    print(f"endpoint={args.endpoint} model={args.model} pdf={args.pdf}\n")
+
+    b64_page0 = rasterize_page_b64(args.pdf, 0, args.dpi)
+    b64_page1 = rasterize_page_b64(args.pdf, 1, args.dpi)
+    images_by_page = {0: b64_page0, 1: b64_page1}
+
+    messages_prefix, call_1, call_2, page_1, page_2 = get_two_tool_calls(
+        client, args.model, args.max_attempts)
+    print(f"\ngot 2 tool_calls: call_1 -> page {page_1}, call_2 -> page {page_2}\n")
+
+    image_1 = image_content_block(page_1, images_by_page[page_1])
+    image_2 = image_content_block(page_2, images_by_page[page_2])
+
+    # Ordering A — buffered (current code): both tool results carry plain text, THEN one
+    # user message carrying both images. Known to work; kept as a sanity check that the
+    # prefix itself is usable.
+    messages_a = messages_prefix + [
+        {"role": "tool", "tool_call_id": call_1.id, "content": "see image below"},
+        {"role": "tool", "tool_call_id": call_2.id, "content": "see image below"},
+        {"role": "user", "content": image_1 + image_2},
+    ]
+
+    # Ordering C — each image travels INSIDE its own tool result as multimodal content,
+    # and no user message follows.
+    messages_c = messages_prefix + [
+        {"role": "tool", "tool_call_id": call_1.id, "content": image_1},
+        {"role": "tool", "tool_call_id": call_2.id, "content": image_2},
+    ]
+
+    print("=== Ordering A (buffered, baseline) ===")
+    ok_a, detail_a = try_ordering(client, args.model, "A", messages_a)
+    print(f"{'OK' if ok_a else 'KO'} — {detail_a}\n")
+
+    print("=== Ordering C (image inside the tool result) ===")
+    ok_c, detail_c = try_ordering(client, args.model, "C", messages_c)
+    print(f"{'OK' if ok_c else 'KO'} — {detail_c}\n")
+
+    print(f"=== Verdict === A: {'OK' if ok_a else 'KO'} — C: {'OK' if ok_c else 'KO'}")
+
+
+if __name__ == "__main__":
+    main()
