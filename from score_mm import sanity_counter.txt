@@ -1,0 +1,16 @@
+from score_mm import sanity_counters
+from analyze_mm import load_scored_mm, quality_by_mm, tools_by_source, inspect_worst
+
+sanity_counters("mm_v2_refactor_p30")          # compteurs d'ensemble
+df = load_scored_mm("mm_v2_refactor_p30")      # une ligne par question, agent_metrics aplaties
+df[["n_steps", "tokens_total", "subagent_invocations",
+    "n_key_figures_checked", "key_figures_grounded_rate",
+    "n_pages_checked", "pages_in_range_rate"]].describe()
+quality_by_mm(df, "answer_format")             # ou "evidence_sources_l"
+tools_by_source(df)
+inspect_worst("mm_v2_refactor_p30", "Chart", n=5)
+
+
+
+pd.read_json("runs/mm_v2_refactor_p30/verifications.jsonl", lines=True), puis groupby(["check", "verdict"]).size().
+
