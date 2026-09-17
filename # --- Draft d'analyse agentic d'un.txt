@@ -1,0 +1,84 @@
+# --- Draft d'analyse agentic d'un run v2 (agent_dom_v2 refactor) ---
+import json
+from collections import Counter
+from pathlib import Path
+import pandas as pd
+
+RUN_ID = "mon_run"                                   # <-- à renseigner
+RUN_DIR = Path("eval/mmlongbench/runs") / RUN_ID
+DERIVED = {"all.jsonl", "extracted.jsonl", "scored.jsonl", "failures.jsonl", "verifications.jsonl"}
+
+rows = [json.loads(l)
+        for p in sorted(RUN_DIR.glob("*.jsonl")) if p.name not in DERIVED
+        for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+rows = [r for r in rows if not r.get("error") and r.get("agent_metrics")]
+M = [r["agent_metrics"] for r in rows]
+print(f"{RUN_ID}: {len(rows)} questions exploitables")
+
+# ---------- Orchestrateur ----------
+orch = pd.DataFrame({
+    "rounds":        [m["orchestrator_rounds"] for m in M],
+    "n_steps":       [m["n_steps"] for m in M],                 # appels LLM des 2 tiers
+    "n_subagent":    [m["subagent_invocations"] for m in M],
+    "hit_max":       [m["hit_max_iterations"] for m in M],
+    "draft_source":  [m["submit_draft_source"] for m in M],
+    "n_cited_pages": [m["n_cited_pages"] for m in M],
+    "tokens_total":  [m["tokens"]["total"] for m in M],
+    "duration_s":    [m["duration_s"] for m in M],
+})
+print("\n== Orchestrateur ==")
+print(orch[["rounds", "n_steps", "n_subagent", "n_cited_pages", "tokens_total", "duration_s"]]
+      .describe().loc[["mean", "50%", "min", "max"]].round(2))
+print("hit_max_iterations :", orch.hit_max.mean().round(3))
+print("submit_draft_source:", orch.draft_source.value_counts().to_dict())
+print("distribution rounds:", orch.rounds.value_counts().sort_index().to_dict())
+
+orch_tools = Counter(t for m in M for t in m["orchestrator_tool_sequence"])
+print("outils orchestrateur (total):", dict(orch_tools))
+print("outils orchestrateur (moy/question):",
+      {k: round(v / len(M), 2) for k, v in orch_tools.items()})
+# séquence complète la plus fréquente
+print("séquences orchestrateur top 5:",
+      Counter(" > ".join(m["orchestrator_tool_sequence"]) for m in M).most_common(5))
+
+# ---------- Sous-agent ----------
+inv = [dict(s, query_id=r["query_id"]) for r, m in zip(rows, M) for s in m["subagent_stats"]]
+sub = pd.DataFrame(inv)
+print(f"\n== Sous-agent : {len(sub)} invocations ==")
+if len(sub):
+    sub["n_tool_calls"] = sub.tool_sequence.map(len)
+    sub["n_sections"]   = sub.section_ids.map(len)
+    sub["tokens_total"] = sub.tokens.map(lambda t: t["total"])
+    print(sub[["n_tool_calls", "n_sections", "n_get_visual", "tokens_total"]]
+          .describe().loc[["mean", "50%", "min", "max"]].round(2))
+    print("hit_cap      :", sub.hit_cap.mean().round(3))
+    print("report_source:", sub.report_source.value_counts().to_dict())
+    sub_tools = Counter(t for seq in sub.tool_sequence for t in seq)
+    print("outils sous-agent (total):", dict(sub_tools))
+    print("outils sous-agent (moy/invocation):",
+          {k: round(v / len(sub), 2) for k, v in sub_tools.items()})
+    print("invocations sans aucun tool call:", int((sub.n_tool_calls == 0).sum()))
+
+# ---------- Protocole / erreurs ----------
+print("\n== Protocole ==")
+proto = pd.DataFrame([{k: m[k] for k in
+                       ("tool_calls_ok", "tool_call_in_content", "tool_call_malformed",
+                        "both_channels", "no_tool_no_answer")} for m in M]).sum()
+print(proto.to_dict())
+inval = Counter((e.get("tier", "?"), e.get("tool", "?")) for m in M for e in m["invalid_tool_args"])
+print("invalid_tool_args par (tier, tool):", dict(inval))
+
+# ---------- Vérifications (non réparantes) ----------
+print("\n== Vérifications ==")
+kf = [m for m in M if m["n_key_figures_checked"]]
+pg = [m for m in M if m["n_pages_checked"]]
+if kf:
+    print(f"key_figures grounded (pooled): "
+          f"{sum(m['key_figures_grounded_rate'] * m['n_key_figures_checked'] for m in kf) / sum(m['n_key_figures_checked'] for m in kf):.3f} "
+          f"sur {sum(m['n_key_figures_checked'] for m in kf)} chiffres")
+if pg:
+    print(f"pages in range (pooled): "
+          f"{sum(m['pages_in_range_rate'] * m['n_pages_checked'] for m in pg) / sum(m['n_pages_checked'] for m in pg):.3f} "
+          f"sur {sum(m['n_pages_checked'] for m in pg)} pages")
+
+orch.head(), sub.head() if len(sub) else None
