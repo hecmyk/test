@@ -1,0 +1,295 @@
+"""FinRAGBench-V runner of the v2 agent — run_benchmark, repointed at agent_dom_v2.
+
+Same contract, same directory layout, same row shape as eval/finragbench/run_benchmark.py,
+so a v2 run is scored by the same score_results and loaded by the same analyze.load_scored
+as a v1 run, and the two sit side by side under runs/ for comparison.
+
+Nothing in run_benchmark is modified: its dataset constants, load_or_build_dom, pdf_for and
+aggregate_run are imported and reused. Only two things are new here — the run_one that
+calls run_dom_agent_v2 instead of run_dom_agent, and the run_metadata.json that records
+what a v2 run means. The per-document loop is a copy of run_benchmark's rather than a call
+into it: that function reaches its module-global run_one, so reusing it would mean patching
+another module's globals at runtime, which a notebook running v1 then v2 in one kernel
+would carry over silently.
+
+The heavy per-invocation artefacts, when asked for, go under runs/{run_id}/debug_v2/ — a
+SUBDIRECTORY, invisible to aggregate_run's non-recursive glob, so they can never fold into
+all.jsonl or reach the scored rows.
+
+The verdict records of the agent's non-repairing checks (key_figures, page ranges) go to
+runs/{run_id}/verifications.jsonl, one line per verdict, next to the per-document files;
+aggregate_run lists that name among its derived files, so it never folds into all.jsonl.
+"""
+
+import json
+import logging
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from tqdm import tqdm
+
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parents[1]
+sys.path.insert(0, str(_REPO))   # repo root, for agent_dom_v2 and eval.rate_limit
+sys.path.insert(0, str(_HERE))   # eval/finragbench/, for run_benchmark and score_results
+
+# Imported as a MODULE, not by value: every budget is read at call time, so setting
+# agent_dom_v2.SEARCH_TOP_K in a notebook cell before the run actually takes effect and
+# lands in run_metadata.json. Binding the constants here would freeze them at import and
+# silently run an arm you did not configure.
+import agent_dom_v2                                          # noqa: E402
+from agent_dom_v2 import run_dom_agent_v2                    # noqa: E402
+from eval.rate_limit import is_infra_failure, log_failure   # noqa: E402
+from openai import BadRequestError                          # noqa: E402
+from run_benchmark import (ARTIFACTS, QUERIES, RUNS, VERIFICATIONS_NAME,  # noqa: E402
+                           aggregate_run, load_or_build_dom, pdf_for)
+from score_results import score_results                     # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# Same definition as the v1 runner, verbatim: the field name and its text are part of what
+# the model is asked, so changing them would make the two arms answer different questions.
+FIELD_DEFINITIONS = {"qa": "Answer the question grounded in the document."}
+
+DEBUG_DIR_NAME = "debug_v2"
+
+# What a v2 run means, prepended to every run's notes. get_section_calls holds the sections
+# the CODE pre-loaded, so used_section in analyze reads "sections were delivered", not "the
+# model chose to read" — the name did not change, the meaning did, and run_metadata.json is
+# the only place a run records what it changed.
+_SEMANTIC_NOTE = (
+    "agent v2 (orchestrator + ephemeral subagent). n_steps = LLM calls of BOTH tiers. "
+    "get_section_calls = sections PRE-LOADED for the subagent, so used_section means "
+    "'delivered', not 'the model chose to read'. There is no get_section tool in v2."
+)
+
+
+def _init_run_v2(run_id: str, notes: str, log_subagent_details: bool) -> Path:
+    """The run directory, created with its metadata on first use.
+
+    run_metadata.json is written ONCE per run_id: a later call on the same run is a
+    continuation, and rewriting it would move created_at away from the code that actually
+    produced the earliest rows.
+
+    Args:
+        run_id: Name of this benchmark iteration.
+        notes: Free text describing what this run changes.
+        log_subagent_details: Whether this run dumps the heavy artefacts.
+
+    Returns:
+        The eval/finragbench/runs/{run_id} directory.
+    """
+    run_dir = RUNS / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = run_dir / "run_metadata.json"
+    if not metadata.exists():
+        metadata.write_text(json.dumps({
+            "run_id": run_id,
+            "agent": "agent_dom_v2",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "notes": f"{_SEMANTIC_NOTE} {notes}".strip(),
+            "ORCHESTRATOR_MODEL": agent_dom_v2.ORCHESTRATOR_MODEL,
+            "SUBAGENT_MODEL": agent_dom_v2.SUBAGENT_MODEL,
+            "ORCHESTRATOR_MAX_ROUNDS": agent_dom_v2.ORCHESTRATOR_MAX_ROUNDS,
+            "SEARCH_TOP_K": agent_dom_v2.SEARCH_TOP_K,
+            "SUBAGENT_MAX_TOOL_CALLS": agent_dom_v2.SUBAGENT_MAX_TOOL_CALLS,
+            "LOG_SUBAGENT_DETAILS": log_subagent_details,
+            "FIELD_DEFINITIONS": FIELD_DEFINITIONS,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return run_dir
+
+
+def run_one(dom: dict, skeleton: str, query: dict, pdf_path: Path | None = None,
+            log_subagent_details: bool = False,
+            verifications: list | None = None) -> tuple[dict, list[dict]]:
+    """Answer one query and build its result row; an agent failure becomes `error`.
+
+    Row shape is run_benchmark.run_one's, field for field, so scoring and analysis do not
+    branch on which agent produced it.
+
+    Only an AGENT failure is caught here, and BadRequestError is the one shape it takes on
+    this endpoint: the conversation outgrew the context window. That is a measured outcome
+    and belongs in the run. Everything else propagates — the caller turns an endpoint
+    failure into a replayable row-less loss, and a bug in our own code stops the run rather
+    than being recorded as an agent error.
+
+    Args:
+        dom: The document's DOM.
+        skeleton: Its XML skeleton.
+        query: One entry of the benchmark's query file.
+        pdf_path: The source PDF, or None to keep the call text-only.
+        log_subagent_details: Collect the heavy per-invocation artefacts.
+        verifications: Caller-owned sink for the per-verdict records of the agent's
+            non-repairing checks, appended in place; None drops them. Only the four
+            aggregate keys reach `agent_metrics`.
+
+    Returns:
+        `(row, debug)`. debug is empty unless log_subagent_details is on, and never enters
+        the row.
+    """
+    started = time.perf_counter()
+    debug: list[dict] = []
+    try:
+        draft, metrics, debug = run_dom_agent_v2(
+            dom, skeleton, FIELD_DEFINITIONS, mode="qa", question=query["query"],
+            pdf_path=pdf_path,
+            max_rounds=agent_dom_v2.ORCHESTRATOR_MAX_ROUNDS,
+            model=agent_dom_v2.ORCHESTRATOR_MODEL,
+            subagent_model=agent_dom_v2.SUBAGENT_MODEL,
+            search_top_k=agent_dom_v2.SEARCH_TOP_K,
+            subagent_max_tool_calls=agent_dom_v2.SUBAGENT_MAX_TOOL_CALLS,
+            log_subagent_details=log_subagent_details, verifications=verifications)
+        answer, error = draft["qa"], None
+    except BadRequestError as e:
+        answer, metrics, error = {}, {}, f"{type(e).__name__}: {e}"
+    metrics["wall_clock_s"] = round(time.perf_counter() - started, 2)
+
+    return {
+        "query_id": query["query-id"],
+        "question": query["query"],
+        "gold_answer": query["answer"],
+        "gold_pages": [int(p) for p in str(query["from_pages"]).split(",")],
+        "answer_type": query["answer_type"],
+        "category": query["category"],
+        "pred_answer": answer.get("answer"),
+        "pred_quote": answer.get("quote"),
+        "pred_source_pages": answer.get("source_pages"),
+        "agent_metrics": metrics,
+        "error": error,
+    }, debug
+
+
+def _dump_debug(run_dir: Path, query_id: str, debug: list[dict]) -> None:
+    """Write one query's subagent artefacts under the run's debug subdirectory."""
+    out_dir = run_dir / DEBUG_DIR_NAME
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / f"{query_id}.json").write_text(
+        json.dumps(debug, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _dump_verifications(run_dir: Path, query_id: str, verifications: list) -> None:
+    """Append one query's verdict records to the run's verifications.jsonl.
+
+    One line per verdict, query_id first: {query_id, check, round, section_id,
+    figure | page, verdict} — a tidy table, read back with pd.read_json(lines=True) or, one
+    line at a time, agent_dom_v2.verifications.VerdictAdapter.validate_json. Same
+    append-and-flush discipline as the per-document results, and written only once the
+    row is: an infra failure raises before this point, so a replayed query never leaves
+    orphan verdicts behind.
+    """
+    with (run_dir / VERIFICATIONS_NAME).open("a", encoding="utf-8") as f:
+        for record in verifications:
+            f.write(record.model_copy(update={"query_id": query_id}).model_dump_json() + "\n")
+
+
+def run_v2(run_id: str, limit: int | None = None, notes: str = "",
+           log_subagent_details: bool = False) -> None:
+    """Run every pending query of one v2 iteration, one JSONL file per document.
+
+    A query already present in the run's file is skipped. That is a crash net, not a resume
+    mode: to start over, pass a new run_id.
+
+    Args:
+        run_id: Name of this iteration; results land in eval/finragbench/runs/{run_id}/.
+        limit: Stop after N queries in total (pilot runs); None runs them all.
+        notes: What this run changes, recorded in run_metadata.json on creation.
+        log_subagent_details: Dump each invocation's report and pre-loaded context under
+            runs/{run_id}/debug_v2/. The check verdicts go to runs/{run_id}/
+            verifications.jsonl regardless of this flag.
+    """
+    queries = json.loads(QUERIES.read_text(encoding="utf-8"))
+    run_dir = _init_run_v2(run_id, notes, log_subagent_details)
+    done_total = 0
+
+    # doc_ocr.json is the real prerequisite: the DOM is derived from it on first use, and
+    # the artifacts are shared with the v1 runs, so both arms read the same frozen DOM.
+    for ocr_path in sorted(ARTIFACTS.glob("*/doc_ocr.json")):
+        doc_dir = ocr_path.parent
+        results = run_dir / f"{doc_dir.name}.jsonl"
+
+        done = set()
+        if results.exists():
+            done = {json.loads(line)["query_id"]
+                    for line in results.read_text(encoding="utf-8").splitlines()
+                    if line.strip()}
+
+        pending = [q for q in queries
+                   if q["query-id"].startswith(doc_dir.name + "_") and q["query-id"] not in done]
+        if limit is not None:
+            pending = pending[:limit - done_total]
+        if not pending:
+            continue
+
+        # Loaded or built once per document, not once per query. The PDF is resolved here
+        # too: its presence is a property of the document, not of the query.
+        dom, skeleton = load_or_build_dom(doc_dir)
+        pdf_path = pdf_for(doc_dir.name)
+
+        print(f"[{run_id}] [{doc_dir.name}] {len(pending)} queries, {len(done)} déjà faites")
+
+        # Appended and flushed per query: a crash keeps every answer already paid for.
+        with results.open("a", encoding="utf-8") as out:
+            bar = tqdm(pending, desc=doc_dir.name, unit="q")
+            for query in bar:
+                bar.set_postfix_str(query["query-id"])
+                # An endpoint failure is an ABSENCE of measurement, so it writes no row:
+                # the resume filter keys on query_id and replays the query on the next
+                # launch. A row would freeze it as done and count as a wrong answer.
+                verifications: list = []
+                try:
+                    row, debug = run_one(dom, skeleton, query, pdf_path,
+                                         log_subagent_details, verifications)
+                except Exception as e:
+                    if not is_infra_failure(e):
+                        raise
+                    log_failure(run_dir, query["query-id"], e)
+                    continue
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                out.flush()
+                if verifications:
+                    _dump_verifications(run_dir, query["query-id"], verifications)
+                if debug:
+                    _dump_debug(run_dir, query["query-id"], debug)
+
+        done_total += len(pending)
+        if limit is not None and done_total >= limit:
+            break
+
+
+def run_and_score(run_id: str, limit: int | None = None, notes: str = "",
+                  log_subagent_details: bool = False) -> Path:
+    """The whole chain in one call: run, aggregate, score.
+
+    aggregate_run and score_results are run_benchmark's and score_results' own, unchanged:
+    a v2 run is aggregated and scored exactly like a v1 run.
+
+    Args:
+        run_id: Name of this iteration.
+        limit: Stop after N queries in total; None runs them all.
+        notes: What this run changes.
+        log_subagent_details: Dump the heavy per-invocation artefacts.
+
+    Returns:
+        Path of scored.jsonl.
+    """
+    run_v2(run_id, limit=limit, notes=notes, log_subagent_details=log_subagent_details)
+    aggregate_run(run_id)
+    return score_results(run_id)
+
+
+
+
+
+
+
+import sys; sys.path.insert(0, "eval/finragbench")
+from run_v2 import run_and_score
+
+# pilote
+run_and_score("fin_v2_pilot", limit=20, notes="v2 pilot sur FinRAG")
+
+# run complet
+run_and_score("fin_v2_01", notes="v2 full, max_rounds=3, sub_max=6")
