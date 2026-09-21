@@ -1,0 +1,281 @@
+"""MMLongBench-Doc oracle arm: the gold pages handed to the baseline reader, no retrieval.
+
+Twin of run_mm_v2 for eval/baselines/oracle.answer_oracle: same per-document JSONL
+layout under runs/{run_id}/, same crash net keyed on query_id, same stratified `p` /
+`seed` draw, and the same scoring chain (aggregate_run, extract_run, score_run) so an
+oracle run is scored exactly like an agent run. One run is ONE mode — md, image or both —
+and the mode is written in run_metadata.json and in every row's agent_metrics["mode"].
+
+What differs from the agent runners, and why:
+
+  - The context is the gold pages, taken from `evidence_pages` (1-indexed in samples.json,
+    converted here to the 0-indexed pages answer_oracle expects). The text is the
+    page-level OCR of reader.ocr_pages, cached under this benchmark's artifacts as
+    baseline_pages_ocr.json — NOT the pipeline's doc_ocr.json, since the oracle is the
+    reader's ceiling with a plain page transcription, the same substrate as on FinRAGBench.
+    ocr_pages transcribes the WHOLE document on first use; the cache makes it a one-off
+    cost per document, shared by the three modes.
+
+  - Unanswerable questions (empty evidence_pages) are SKIPPED. Handing the reader an empty
+    context makes it abstain, which scores 1.0 against a "Not answerable" gold: a trivial
+    point, not a measurement. The scored run therefore covers the answerable questions
+    only, and any comparison against an agent run must be made on that subset.
+
+  - answer_oracle does not raise: a reader failure comes back as an `error` row with
+    pred_answer None. On this benchmark that None renders as "Not answerable" at
+    extraction, so such a row is NOT written to the results (it would be frozen as done
+    by the resume filter) and goes to failures.jsonl instead, to be replayed on the next
+    launch — the same discipline as run_mm_v2's infra net.
+"""
+
+import ast
+import json
+import logging
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from tqdm import tqdm
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parents[1]))   # repo root, for eval.baselines and config
+sys.path.insert(0, str(_HERE))              # eval/mmlongbench/, for dataset, run_mm, extract, score
+
+from config import DPI                                        # noqa: E402
+from dataset import load_samples, sample_dataset              # noqa: E402
+from eval.baselines import reader                             # noqa: E402
+from eval.baselines.oracle import MODES, answer_oracle        # noqa: E402
+from eval.rate_limit import FAILURES_NAME                     # noqa: E402
+from extract import extract_run                               # noqa: E402
+from run_mm import ARTIFACTS, RUNS, aggregate_run, pdf_for    # noqa: E402
+from score_mm import score_run                                # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# reader.ocr_pages caches next to reader.ARTIFACTS, which points at FinRAGBench's
+# artifacts. Repointed here, at import, so the MMLongBench page transcriptions land in
+# eval/mmlongbench/artifacts/{stem}/baseline_pages_ocr.json, next to the document's DOM.
+reader.ARTIFACTS = ARTIFACTS
+
+
+def gold_pages_of(sample: dict) -> list[int]:
+    """The gold pages of a question, 0-indexed, as answer_oracle expects them.
+
+    `evidence_pages` is a string in samples.json ("[5]") and is 1-indexed, like
+    everywhere else in this benchmark (see analyze_mm). This is the only place the
+    conversion happens for the oracle arm.
+
+    Args:
+        sample: One entry of dataset.load_samples.
+
+    Returns:
+        The 0-indexed pages, in the dataset's order; empty for an unanswerable question.
+    """
+    return [p - 1 for p in ast.literal_eval(sample["evidence_pages"])]
+
+
+def _init_run(run_id: str, mode: str, notes: str, p: float | None, seed: int) -> Path:
+    """The run directory, created with its metadata on first use.
+
+    Written ONCE per run_id, like the agent runners: a later call is a continuation. The
+    mode is part of the metadata because a run is one arm — continuing a run with another
+    mode would mix two arms in one scored file, so it is refused.
+
+    Args:
+        run_id: Name of this oracle iteration.
+        mode: One of oracle.MODES.
+        notes: Free text describing this run.
+        p: Stratified sampling fraction, or None for the full question list.
+        seed: Seed of that draw.
+
+    Returns:
+        The eval/mmlongbench/runs/{run_id} directory.
+
+    Raises:
+        ValueError: When the run exists with a different mode.
+    """
+    run_dir = RUNS / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = run_dir / "run_metadata.json"
+    if metadata.exists():
+        previous = json.loads(metadata.read_text(encoding="utf-8")).get("mode")
+        if previous != mode:
+            raise ValueError(f"{run_id} was created in mode {previous!r}, not {mode!r}: "
+                             f"one run is one arm, use a new run_id")
+        return run_dir
+
+    metadata.write_text(json.dumps({
+        "run_id": run_id,
+        "benchmark": "MMLongBench-Doc",
+        "agent": "oracle",
+        "mode": mode,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "notes": notes,
+        "READER_MODEL": reader.MODEL,
+        "DPI": DPI,
+        "unanswerable": "skipped",
+        "sample_p": p,
+        "sample_seed": seed if p is not None else None,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return run_dir
+
+
+def run_one(sample: dict, mode: str, pages_md: dict[int, str], pdf_path: Path) -> dict:
+    """Answer one question from its gold pages and build its MMLongBench row.
+
+    Row shape is run_mm.run_one's, field for field — gold-free, joined by query_id in
+    score_mm — so extraction and scoring do not branch on which arm produced it. The
+    reader's scalar `source_page` goes into `pred_source_pages` as is: metrics.as_pages
+    absorbs the scalar at read time, as it does for the pre-list agent runs.
+
+    Args:
+        sample: One entry of dataset.load_samples, answerable.
+        mode: One of oracle.MODES.
+        pages_md: reader.ocr_pages of the document.
+        pdf_path: The source PDF.
+
+    Returns:
+        The result row; a reader failure is an `error` row with pred_answer None.
+    """
+    record = answer_oracle(sample["question"], gold_pages_of(sample), mode,
+                           pages_md, str(pdf_path))
+    return {
+        "query_id": sample["query_id"],
+        "doc_id": sample["doc_id"],
+        "stem": sample["stem"],
+        "question": sample["question"],
+        "pred_answer": record["pred_answer"],
+        "pred_quote": record["pred_quote"],
+        "pred_source_pages": record["pred_source_page"],
+        "agent_metrics": record["agent_metrics"],
+        "error": record["error"],
+    }
+
+
+def run_oracle_mm(run_id: str, mode: str = "both", limit: int | None = None,
+                  notes: str = "", p: float | None = None, seed: int = 42) -> None:
+    """Run every pending answerable question of one oracle arm, one JSONL per document.
+
+    A question already present in the run's file is skipped — a crash net, not a resume
+    mode: to start over, pass a new run_id. Documents are the ones with pipeline
+    artifacts, in sorted order, so the arm answers on the same document set as the agent
+    runs; a document whose PDF is not on disk is skipped with a warning, since every mode
+    needs the file (ocr_pages reads it even in md mode).
+
+    Args:
+        run_id: Name of this iteration; results land in eval/mmlongbench/runs/{run_id}/.
+        mode: "md", "image" or "both" — the context handed to the reader.
+        limit: Stop after N questions in total (pilot runs); None runs them all.
+        notes: What this run is, recorded in run_metadata.json on creation.
+        p: Fraction of a STRATIFIED draw (dataset.sample_dataset); None takes every
+            question. Match the p and seed of the agent run you are comparing against.
+        seed: Seed of that draw.
+    """
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+
+    samples = load_samples() if p is None else sample_dataset(p, seed)
+    run_dir = _init_run(run_id, mode, notes, p, seed)
+    done_total = 0
+
+    for ocr_path in sorted(ARTIFACTS.glob("*/doc_ocr.json")):
+        doc_dir = ocr_path.parent
+        results = run_dir / f"{doc_dir.name}.jsonl"
+
+        done = set()
+        if results.exists():
+            done = {json.loads(line)["query_id"]
+                    for line in results.read_text(encoding="utf-8").splitlines()
+                    if line.strip()}
+
+        pending = [s for s in samples
+                   if s["stem"] == doc_dir.name and s["query_id"] not in done
+                   and gold_pages_of(s)]
+        if limit is not None:
+            pending = pending[:limit - done_total]
+        if not pending:
+            continue
+
+        pdf_path = pdf_for(doc_dir.name)
+        if pdf_path is None:
+            print(f"[{run_id}] [{doc_dir.name}] PDF absent, {len(pending)} questions sautées")
+            continue
+
+        # One transcription per document, cached: the three modes share it, and image
+        # mode pays it too rather than branching — the cache is what makes the arms
+        # comparable, since md and both read exactly the same text.
+        pages_md = reader.ocr_pages(str(pdf_path))
+
+        print(f"[{run_id}] [{doc_dir.name}] {len(pending)} questions, {len(done)} déjà faites")
+
+        with results.open("a", encoding="utf-8") as out:
+            bar = tqdm(pending, desc=doc_dir.name[:30], unit="q")
+            for sample in bar:
+                bar.set_postfix_str(sample["query_id"][-8:])
+                row = run_one(sample, mode, pages_md, pdf_path)
+                if row["error"] is not None:
+                    # Not a row: written, it would be frozen as done and score as an
+                    # abstention. Logged where aggregate_run never reads, so the resume
+                    # filter replays it.
+                    with (run_dir / FAILURES_NAME).open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({"query_id": sample["query_id"],
+                                            "error": row["error"],
+                                            "at": time.strftime("%Y-%m-%dT%H:%M:%S")},
+                                           ensure_ascii=False) + "\n")
+                    logger.warning("%s perdue (reader), rejouable à la reprise : %s",
+                                   sample["query_id"], row["error"][:80])
+                    continue
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                out.flush()
+
+        done_total += len(pending)
+        if limit is not None and done_total >= limit:
+            break
+
+
+def run_and_score(run_id: str, mode: str = "both", limit: int | None = None,
+                  notes: str = "", p: float | None = None, seed: int = 42) -> Path:
+    """The whole chain in one call: run, aggregate, extract, score.
+
+    Args:
+        run_id: Name of this iteration.
+        mode: "md", "image" or "both".
+        limit: Stop after N questions in total; None runs them all.
+        notes: What this run is.
+        p: Stratified sampling fraction, or None for every question.
+        seed: Seed of that draw.
+
+    Returns:
+        Path of the scoring output.
+    """
+    run_oracle_mm(run_id, mode=mode, limit=limit, notes=notes, p=p, seed=seed)
+    aggregate_run(run_id)
+    extract_run(run_id)
+    return score_run(run_id)
+
+
+
+
+
+
+import sys; sys.path.insert(0, "eval/mmlongbench")
+from run_oracle_mm import run_and_score
+
+# pilote
+run_and_score("mm_oracle_both_01", mode="both", limit=10, notes="oracle mix pilote")
+
+# même tirage stratifié que tes runs mm_strat30_* (p=0.3, seed=42)
+run_and_score("mm_oracle_both_02", mode="both", p=0.3, notes="oracle mix, strat30")
+
+
+
+
+
+
+
+
+
+
+
