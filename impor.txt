@@ -1,0 +1,34 @@
+import json
+from pathlib import Path
+
+RUNS_DIR = Path("eval/finragbench/runs")
+
+run_id_1 = "run_1"
+run_id_2 = "run_2"
+category_target = "Table-Numerical Calculation"
+
+def load_scores(run_id):
+    path = RUNS_DIR / run_id / "scored.jsonl"
+
+    with path.open(encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+
+    # query_id -> ligne complète
+    return {row["query_id"]: row for row in rows}
+
+scores_1 = load_scores(run_id_1)
+scores_2 = load_scores(run_id_2)
+
+query_ids = [
+    query_id
+    for query_id, row_1 in scores_1.items()
+    if row_1["category"] == category_target
+    and row_1["judge_score"] == 1
+    and query_id in scores_2
+    and scores_2[query_id]["judge_score"] == 0
+]
+
+print(f"{len(query_ids)} query(s) trouvée(s)\n")
+
+for query_id in query_ids:
+    print(query_id)
