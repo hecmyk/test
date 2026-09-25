@@ -1,0 +1,67 @@
+import json
+from pathlib import Path
+
+RUNS_DIR = Path("eval/finragbench/runs")
+
+run_id_1 = "run_1"
+run_id_2 = "run_2"
+category_target = "Table-Numerical Calculation"
+
+# Adapte le nom du fichier de résultats si nécessaire
+results_1 = json.loads((RUNS_DIR / run_id_1 / "results.json").read_text(encoding="utf-8"))
+results_2 = json.loads((RUNS_DIR / run_id_2 / "results.json").read_text(encoding="utf-8"))
+
+queries = json.loads(
+    Path("finragbench-V/queries_en.json").read_text(encoding="utf-8")
+)
+
+# Suppose que chaque résultat contient : {"query_id": "...", "score": 0 ou 1}
+scores_1 = {x["query_id"]: x["score"] for x in results_1}
+scores_2 = {x["query_id"]: x["score"] for x in results_2}
+
+selected = [
+    q for q in queries
+    if q["category"] == category_target
+    and scores_1.get(q["query-id"]) == 1
+    and scores_2.get(q["query-id"]) == 0
+]
+
+print(f"{len(selected)} query(s) trouvée(s)\n")
+
+for q in selected:
+    print(f'ID: {q["query-id"]}')
+    print(f'Question: {q["query"]}')
+    print(f'Réponse: {q["answer"]}')
+    print("-" * 100)
+
+
+
+
+
+
+
+from pathlib import Path
+from statistics import median
+from pypdf import PdfReader
+
+pdf_folder = Path(r"C:\chemin\vers\ton\dossier")
+
+page_counts = []
+
+for pdf_path in pdf_folder.glob("*.pdf"):
+    try:
+        page_counts.append(len(PdfReader(pdf_path).pages))
+    except Exception as e:
+        print(f"PDF ignoré (illisible) : {pdf_path.name}")
+
+print(f"Nombre de PDF lus : {len(page_counts)}")
+print(f"Nombre moyen de pages : {sum(page_counts) / len(page_counts):.2f}")
+print(f"Médiane du nombre de pages : {median(page_counts)}")
+
+
+
+
+
+
+
+
