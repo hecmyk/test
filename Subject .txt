@@ -1,0 +1,97 @@
+Subject: Thank you!
+
+Hi everyone,
+
+Today's my last day, and I wanted to say thank you before I go. These past months have been a really great experience — I learned a lot, worked on things I found genuinely interesting, and enjoyed getting to know all of you.
+
+A special thank you to [Prénom Nom] for the guidance and support throughout the internship — it made a real difference.
+
+I hope our paths cross again. Feel free to stay in touch: https://www.linkedin.com/in/hamzaelabdouni/.
+
+Thanks again for everything,
+Hamza
+
+
+# 1. Mettre de côté les modifs sur config.py / pdf_utils.py
+git stash push -m "config+pdf_utils changes before switching to master"
+
+# 2. Vérifier que c'est clean
+git status
+
+# 3. Repartir de master à jour
+git checkout master
+git pull
+
+# 4. Créer la nouvelle branche
+git checkout -b Doc_Agent_dom_v1_v2
+
+# 5. Récupérer les modifs — elles atterrissent sur cette nouvelle branche
+git stash pop
+
+# 6. Vérifier qu'elles sont bien là
+git diff config.py pdf_utils.py
+git stash list   # doit être vide
+
+
+
+
+git checkout -b Doc_Agent_dom_v1_v2
+
+
+git add \
+  config.py \
+  dom_build.py \
+  dom_build_levels.py \
+  dom_render.py \
+  dom_tools.py \
+  dom_visual.py \
+  reading_order.py \
+  dom_prompts.yaml \
+  prompts_dom_v2.yaml \
+  agent_dom.py \
+  agent_dom_v2/ \
+  eval/rate_limit.py \
+  eval/metrics.py \
+  eval/judges.py \
+  eval/baselines/__init__.py \
+  eval/baselines/fullctx.py \
+  eval/baselines/oracle.py \
+  eval/baselines/reader.py \
+  eval/finragbench/run_benchmark.py \
+  eval/finragbench/run_v2.py \
+  eval/finragbench/score_results.py \
+  eval/mmlongbench/dataset.py \
+  eval/mmlongbench/extract.py \
+  eval/mmlongbench/score_mm.py \
+  eval/mmlongbench/run_mm.py \
+  eval/mmlongbench/run_mm_v2.py \
+  eval/mmlongbench/run_oracle_mm.py \
+  eval/mmlongbench/render.py \
+  eval/mmlongbench/dom_prompts_mm.yaml \
+  eval/mmlongbench/dom_prompts_mm_v2.yaml \
+  eval/mmlongbench/official/ \
+  README_XML_AGENT.md 
+ 
+
+
+
+git status
+
+
+
+git commit -m "Add DOM agents v1/v2 and FinRAGBench/MMLongBench eval harness" -m "Adds the DOM-based agents (v1 single-agent, v2 orchestrator+subagent) and
+the evaluation harness to run and score them on FinRAGBench-V and
+MMLongBench-Doc, plus full-context and oracle baselines for comparison.
+
+Builds on PR 1's layout/OCR pipeline (see README_pipeline.md).
+
+Not included in this PR: analysis/plotting tools (eval/analyze.py,
+analyze_mm.py), ad hoc diagnostics (isolated_visual.py, title_diagnostic.py),
+and notebooks — see README.md for the full list and rationale."
+
+
+
+git push -u origin Doc_Agent_dom_v1_v2
+
+
+
