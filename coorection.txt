@@ -1,0 +1,215 @@
+dom_build.py
+L19-20: Delete lines 19-20 and the blank line before them.
+L4-7: Replace with: The caller computes page_dims via pdf_utils.page_dims_from_pdf(pdf_path), calls build_dom, then writes the result to doc_dom.json next to doc_ocr.json. and Contents: header + flat index, section tree with caption resolution, ToC detection, title levels (injected leveler), running-title de-dup.
+L67: Replace (see [[dom-id-parity]]) with (see markdown_build.id_to_bbox).
+L123: """Atom ids of every label-"content" atom on pages 0..TOC_MAX_PAGE; any of them flags the doc as having a ToC."""
+L149: Replace eval/title_diagnostic.py with eval/finragbench/title_diagnostic.py.
+L150-153: Replace y_rel < 0.12 with y_rel < _RUNNING_MAX_Y_REL and density >= 0.8 with density >= _RUNNING_MIN_DENSITY; delete the quoted figures in the explanation.
+L221: Add above it: # a footnote promoted from chrome to caption is indexed as content
+L240: Move the comment above "children": [], as: # atom_ids of the section body, in reading order; EXCLUDES the title atom (see title_id).
+L169, 279: Add in this file:
+python
+  def _atom_text(item: dict) -> str:
+      return (item.get("text") or "").strip()
+
+Use at both lines as _atom_text(a["item"]).
+
+L126: config.py → TOC_MAX_PAGE = 4 # last 0-indexed page scanned for a table of contents. Import and use if a["page"] > TOC_MAX_PAGE:.
+L285: is_opener = (not is_caption) and label in DOM_TITLE_LABELS
+L345-347: config.py → MIN_TITLE_LEVEL = 1, MAX_TITLE_LEVEL = 4. Use MIN_TITLE_LEVEL <= lvl <= MAX_TITLE_LEVEL.
+dom_title_levels.py
+L18-19: _client = OpenAI(base_url=MISTRAL_BASE_URL, api_key=MISTRAL_API_KEY). Delete MODEL, use _client.chat.completions.create(model=MISTRAL_AGENT_MODEL, ...) at L45-46.
+L23-26: from config import MIN_TITLE_LEVEL, MAX_TITLE_LEVEL, build the strings as the f-strings Claude Code gave.
+reading_order.py
+L1-13 module docstring: remplacer par la version anglaise donnée.
+L21: """Intersection over the area of the smaller box (0.0 if disjoint)."""
+L29: """Edge-to-edge distance (0.0 if the boxes touch or overlap)."""
+L36-41: remplacer par la docstring anglaise donnée.
+L50-56, 60-63: remplacer par la docstring anglaise donnée.
+L71: # backbone follows order, so [0] holds the min
+L72-73: remplacer par le commentaire anglais donné.
+L80: # walked in ascending dim7
+L75-76: Delete lines 75-76 (early return redondant).
+dom_render.py
+L229-232, 166-167, 178-180: delete max_depth, include_visuals, max_visuals_per_section de build_outline_xml, _render_section, _render_visuals (détails donnés par Claude Code).
+L250-251: Delete (duplicate du "No degradation cascade").
+L83: """Page span as "5-12", or "5" for a single page; None when the section has no page territory."""
+L40-41: Delete _strip_control_chars; inline dans clean_text: return _WHITESPACE.sub(" ", _CONTROL_CHARS.sub("", text or "")).strip()
+L25, 108, 158: from config import DOM_VISUAL_LABELS, TABLE_LABELS; _FIGURE_LABELS = DOM_VISUAL_LABELS - TABLE_LABELS; use TABLE_LABELS aux deux endroits.
+L229: _PREVIEW_CHARS = 120 près de L31; preview_chars: int = _PREVIEW_CHARS.
+L280: config.py → CHARS_PER_TOKEN = 4. Use len(xml) // CHARS_PER_TOKEN.
+L148: NO_CAPTION = "(none)" # quoted in prompts_dom*.yaml; return NO_CAPTION.
+dom_visual.py
+L67-68: Replace 0 keeps the historical no-margin crop. with 0 means no margin.
+L105-108: Replace 0, the default, is the historical tight crop and is what the agent gets with 0, the default, is the tight crop and is what the agent gets
+L42: for entry in header["pages"]:
+L74-77: Delete try/except; keep x1, y1, x2, y2 = (int(v) for v in bbox)
+L167: dpi = header["dpi"]; delete L26 (from config import DPI).
+dom_tools.py
+L36: Replace (the historical, and still default, one) with (the default one)
+L124-125: Replace the ones get_crop and the skeleton use with the ones get_visual and the skeleton use
+L306-307: A visual never gets a centred window: a window taken from the middle of an OCRed table is figures without the header row that names them, which is worse than useless.
+L244: from config import DOM_TITLE_LABELS, DOM_VISUAL_LABELS; _VISUAL_KINDS = DOM_VISUAL_LABELS.
+L297-298: Delete lines + le Raises: block; la branche devient return source["visual_kind"].
+agent_dom.py
+L254-255: Delete.
+L128-166: Delete les commentaires inline. Append à la docstring: Keys after tool_sequence were added in later versions; never reorder, the run log relies on the order.
+L291-292: Replace Without it the run is exactly the text-only one it was before with Without it the run is text-only.
+L361, 366: _LOG_CHARS = 200, use [:_LOG_CHARS] aux deux endroits.
+L280: config.py → MAX_STEPS = 10. Use max_steps: int = MAX_STEPS.
+L177: expected = dom["header"]["source"]["pdf"]
+prompts_dom.yaml
+L1, 94: Rename dom_system/dom_user_template → kyc_system/kyc_user_template. Nécessite aussi 1 ligne dans agent_dom.py : "kyc": ("kyc_system", "kyc_user_template", DRAFT_SCHEMA).
+L195-198: remplacer par le texte reformaté donné (règle 1).
+L152-162: déplacer le paragraphe comme indiqué.
+L211-213: Do not derive a number from the section's pages attribute in the skeleton or from a search result, do not compute it, do not shift it.
+prompts_dom_v2.yaml
+L177: "visuals_present": ["p12_e3: bar chart, Q4 revenue by region"]
+agent_dom_v2/init.py
+L11-12: Replace the favourable oracle_img case of E1/E5 with the favourable oracle "both" case (markdown and images of the same pages).
+agent_dom_v2/settings.py
+L13: Delete Same as before the split; the facade merely re-exports what is defined here.
+agent_dom_v2/protocol.py
+L244-245: Delete.
+L53-54: return {**inner, "type": [inner["type"], "null"]}
+agent_dom_v2/report.py
+L22, 42, 61: Schema announced to the model, never enforced on its response — see _normalize_report for how it is read back.
+L116-118, 127: ajouter dans ce fichier :
+python
+  def _list_of(payload, key, keep):
+      value = payload.get(key)
+      return [i for i in value if keep(i)] if isinstance(value, list) else []
+
+Puis "evidence": _list_of(payload, "evidence", lambda i: isinstance(i, dict)) (et pareil pour section_contents, try_section_ids). Delete les _dicts imbriqués.
+
+agent_dom_v2/sections.py
+L133-138: Delete lines 133-138; keep markdown = render_section(section_id, dom).
+agent_dom_v2/orchestrator.py
+L60-61: Schema announced to the model, never enforced on its response. The response is read by _delegate, which serves what it can of a partly wrong call (unknown ids dropped and recorded, the rest delivered) rather than refusing it.
+L77-78: Schema announced to the model, never enforced on its response; the response is read by _delegate. top_k's description is a template: the run's k is only known at call time, so build_search_and_read_tool formats it in.
+L45-50: Replace with # Detection only, never parsing: one tuple per tier (see agent_dom.looks_like_tool_call_in_content).
+L335-336: # k is held fixed by design: a larger request is clamped, not obeyed.
+L237-238, 258-259: Drop l'argument dupliqué dans les deux appels (voir le code exact donné par Claude Code).
+L279-281:
+python
+  metrics["n_cited_pages"] = sum(
+      len(p) for e in draft.values() if isinstance(p := e.get("source_pages"), list))
+L86-89: # 0 = not given: _delegate falls back to search_top_k
+L355: "path": maps["crumb"][hit["section_id"]],
+agent_dom_v2/subagent.py
+L25-30: Replace with # Detection only, never parsing: this tier's tool names (see orchestrator._ORCHESTRATOR_TOOL_NAMES).
+eval/rate_limit.py
+L1-9, 11-15, 27, 28, 30, 36-38, 43, 49-59, 70, 74-76, 83-89, 94: appliquer toutes les traductions anglaises données par Claude Code (texte prêt à coller).
+L69: BACKOFF_JITTER_S = 5, use random.uniform(0, BACKOFF_JITTER_S).
+L45: SERVER_ERROR_MIN_STATUS = 500, use >= SERVER_ERROR_MIN_STATUS.
+⚠️ NE PAS appliquer L3-5 ("may be outdated... re-measure") sans vérifier toi-même le comportement réel de l'endpoint (token-per-minute vs requests-per-second).
+eval/metrics.py
+L118-150: Delete (la fonction test_metrics n'est jamais appelée).
+L22: rename s → text.
+L19: _TRIM_CHARS = " .,;:!?", use text.strip(_TRIM_CHARS).
+eval/judges.py
+L27 vs 45-46: Replace L27 par Reply with a single JSON object containing a brief reasoning (1-2 sentences) and the score, in the exact structure given under "Output format" below.
+L101, 105, 106: _RAW_LOG_CHARS = 200, use raw[:_RAW_LOG_CHARS].
+⚠️ NE PAS appliquer JUDGE_MODEL sans confirmer quel modèle tourne réellement derrière le judge (Claude Code lui-même dit "confirm before merging").
+eval/analyze.py
+L702, 703, 721, 743, 744: appliquer les textes anglais donnés.
+L21-24, 4-5, 18-19, 659-661: appliquer les remplacements donnés.
+L475-598 etc.: ajouter # --- Notebook API: no in-repo caller, used interactively --- au-dessus de tools_per_sample.
+L349, 382, 491, 586: rename g → grouped.
+L518, 626, 672: rename ex → calls / visual_rows.
+L434: n_rows = len(df).
+L685-687, 86: définir les regex nommées données.
+L127, 174: simplifier les checks isinstance comme indiqué.
+eval/baselines/fullctx.py
+L98-100: for i, candidate in enumerate(candidates, 1).
+L105: BATCH_SIZE = 50, BATCH_OVERLAP = 3 près de L34.
+L34: config.py → CONTEXT_WINDOW = 128_000 # tokens.
+eval/baselines/oracle.py
+L21, 35: Delete import logging et logger = logging.getLogger(__name__).
+L9: image the gold pages rasterized at config.DPI, no text at all
+L100, 113: needs_md = mode != "image", needs_images = mode != "md".
+eval/baselines/reader.py
+L194: Replace eval/artifacts/{stem}/baseline_pages_ocr.json with eval/finragbench/artifacts/{stem}/baseline_pages_ocr.json.
+L147-153: cited = as_pages(data.get("cited_pages")).
+L131-133: rename variable comme indiqué.
+L220-222: rename ex, fut → executor, future.
+L138: _RAW_LOG_CHARS = 200.
+L93: except json.JSONDecodeError:
+eval/finragbench/run_benchmark.py
+L44, 45: textes donnés.
+L211: ... {len(pending)} queries, {len(done)} already done
+L261: print(f"[{run_id}] {len(lines)} rows -> {out}")
+L4, 65, 181, 237: remplacer eval/runs/ par eval/finragbench/runs/.
+L32: déplacer from openai import BadRequestError dans le groupe third-party.
+L37: config.py → FINRAGBENCH_ROOT = Path("/home/datacamp/data/FinRAGBench-V").
+L48: Delete MAX_STEPS = 10, utiliser config.MAX_STEPS (nécessite que la modif agent_dom.py soit déjà faite).
+eval/finragbench/run_v2.py
+L25, 50: Delete import logging et logger.
+L231: ... {len(pending)} queries, {len(done)} already done
+L45: déplacer l'import openai.
+eval/finragbench/score_results.py
+L73: Delete (doublon du logger.info).
+L3, 32: remplacer eval/runs/ par eval/finragbench/runs/.
+L63: config.py → JUDGE_WORKERS = 8.
+eval/finragbench/title_diagnostic.py
+L4-5: so thresholds could be calibrated for the running-title de-dup in dom_build (_detect_running_titles).
+L31: sys.path.insert(...), puis from config import DOM_TITLE_LABELS as TITLE_LABELS # noqa: E402. Delete l'ancienne L31.
+L147: déplacer _COLUMNS sous L34.
+L117: rename rec → recurring.
+L34: TITLE_MAX_CHARS = 60, use key[:TITLE_MAX_CHARS].
+L25-30: Delete les constantes HEADER_KEY…BBOX_KEY, utiliser les littéraux directement.
+L132, 142: SPAN_BINS, OCC_BINS comme donné.
+L68-74: simplifier les .get() chaînés comme indiqué.
+eval/finragbench/isolated_visual.py
+L53: Delete lines 48-53.
+L255: print(f"[{run_id}] {len(selected)} queries selected from {source_run_id}")
+L5: remplacer eval/runs/ par eval/finragbench/runs/.
+L56-64: ajouter # Mirrors analyze.load_scored (outcome block): change both together.
+L226: CHART_CATEGORY_PREFIX = "Chart-".
+L230: COMPARABLE_OUTCOMES = ("correct", "wrong", "abstention").
+eval/mmlongbench/dataset.py
+L51-61, 70-77, 86: docstrings/commentaires anglais donnés.
+L20: config.py → MMLONGBENCH_ROOT = Path("/home/datacamp/data/MMLongBench-Doc").
+L3, 29: textes donnés.
+L69: config.py → DEFAULT_SEED = 42; rename p → fraction.
+L80: rename tout en all_samples (L80-101).
+eval/mmlongbench/extract.py
+L139, 160: textes donnés.
+L115-116: texte donné sur max_workers.
+L156: remplacer par le if explicite donné.
+L61, 87: FAILED_SENTINEL = "Failed" près de L44.
+eval/mmlongbench/score_mm.py
+L66, 84, 87, 90, 115, 120-121, 123, 127-128: textes donnés.
+L126-128: FAIL_SENTINEL = "Fail to answer", MAX_FAIL_RATE = 0.02 près de L27.
+eval/mmlongbench/run_mm.py
+L42, 43, 44, 229, 281: textes donnés.
+L34: déplacer l'import openai.
+L233, 235: _DESC_CHARS, _ID_TAIL_CHARS = 30, 8.
+eval/mmlongbench/run_mm_v2.py
+L29, 57: Delete import logging et logger.
+L18: sample = sample_dataset(0.3); rm.load_samples = lambda: sample
+L248: texte donné.
+eval/mmlongbench/run_oracle_mm.py
+L209, 226-227, 231: textes donnés.
+eval/mmlongbench/analyze_mm.py
+Toutes les traductions/docstrings données (L1-12, 25-26, 37-38, 43/81/377, 48/141/194/252/366, 51, 59, 61-63, 105-110, 115-119, 145, 150, 163-168, 174-175, 179, 197-200, 209, 215-220, 225, 234-235, 237, 255-263, 280, 288, 299-303, 308, 310, 311, 318-322, 327, 328, 331, 339-343, 351, 352, 355, 356, 369-373, 391-414, 104) — toutes mono-fichier, copie directe.
+L34: from render import NOT_ANSWERABLE # noqa: E402, delete l'ancienne L34.
+L54, 385, 230, 128, 181, 74, 81, 210: renames locaux donnés.
+L214, 408, 414, 399: constantes données.
+Fichiers à supprimer entièrement
+eval/mmlongbench/dom_prompts_mm.backup.yaml : Delete le fichier.
+eval/mmlongbench/dom_prompts_mm.yaml : Delete les blocs dom_system:/dom_user_template:.
+config.py — bloc à ajouter
+python
+TOC_MAX_PAGE = 4
+MIN_TITLE_LEVEL = 1
+MAX_TITLE_LEVEL = 4
+CHARS_PER_TOKEN = 4
+CONTEXT_WINDOW = 128_000
+MAX_STEPS = 10
+DEFAULT_SEED = 42
+JUDGE_WORKERS = 8
+FINRAGBENCH_ROOT = Path("/home/datacamp/data/FinRAGBench-V")
+MMLONGBENCH_ROOT = Path("/home/datacamp/data/MMLongBench-Doc")
+
+(JUDGE_MODEL et QA_FIELD_DEFINITIONS volontairement exclus — le premier nécessite vérification, le second dépend d'une consolidation cross-fichiers.)
